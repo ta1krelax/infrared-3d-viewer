@@ -38,20 +38,69 @@ MAX_REFINEMENT_LEVEL = 6
 MAX_REFINED_POINTS = 90_000
 
 DEFAULT_VIEW_NAME = "常规透视"
-VIEW_PRESETS: dict[str, tuple[float, float, float]] = {
-    DEFAULT_VIEW_NAME: (28.0, -55.0, 0.0),
-    "立方体 · 面（正视）": (0.0, -90.0, 0.0),
-    "立方体 · 棱（双面）": (0.0, -45.0, 0.0),
-    "立方体 · 角（等轴测）": (35.264, -45.0, 0.0),
-    "反向等轴测": (35.264, 135.0, 0.0),
-    "俯视（XY）": (90.0, -90.0, 0.0),
-    "仰视（XY）": (-90.0, -90.0, 0.0),
-    "后视": (0.0, 90.0, 0.0),
-    "左视": (0.0, 0.0, 0.0),
-    "右视": (0.0, 180.0, 0.0),
-    "高角度透视": (55.0, -45.0, 0.0),
-    "低角度透视": (15.0, -55.0, 0.0),
+CUSTOM_VIEW_NAME = "自定义数值"
+PERSPECTIVE_LABEL = "透视投影"
+ORTHOGRAPHIC_LABEL = "正交投影"
+PROJECTION_MODES = {
+    PERSPECTIVE_LABEL: "persp",
+    ORTHOGRAPHIC_LABEL: "ortho",
 }
+
+
+@dataclass(frozen=True)
+class ViewPreset:
+    projection: str
+    rotation_x: float
+    rotation_y: float
+    rotation_z: float = 0.0
+    zoom_percent: float = 100.0
+
+
+# The numeric controls describe sample rotation instead of Matplotlib's camera
+# angles.  A zero rotation is the front face; horizontal sample rotation Y is
+# camera azimuth + 90 degrees.
+VIEW_PRESETS: dict[str, ViewPreset] = {
+    DEFAULT_VIEW_NAME: ViewPreset(PERSPECTIVE_LABEL, 28.0, 35.0),
+    "立方体 · 面（正视）": ViewPreset(PERSPECTIVE_LABEL, 0.0, 0.0),
+    "立方体 · 棱（双面）": ViewPreset(PERSPECTIVE_LABEL, 0.0, 45.0),
+    "立方体 · 角（等轴测）": ViewPreset(PERSPECTIVE_LABEL, 35.264, 45.0),
+    "反向等轴测": ViewPreset(PERSPECTIVE_LABEL, 35.264, -135.0),
+    "俯视（XY）": ViewPreset(PERSPECTIVE_LABEL, 90.0, 0.0),
+    "仰视（XY）": ViewPreset(PERSPECTIVE_LABEL, -90.0, 0.0),
+    "后视": ViewPreset(PERSPECTIVE_LABEL, 0.0, 180.0),
+    "左视": ViewPreset(PERSPECTIVE_LABEL, 0.0, 90.0),
+    "右视": ViewPreset(PERSPECTIVE_LABEL, 0.0, -90.0),
+    "高角度透视": ViewPreset(PERSPECTIVE_LABEL, 55.0, 45.0),
+    "低角度透视": ViewPreset(PERSPECTIVE_LABEL, 15.0, 35.0),
+    "正交 · 正视": ViewPreset(ORTHOGRAPHIC_LABEL, 0.0, 0.0),
+    "正交 · 后视": ViewPreset(ORTHOGRAPHIC_LABEL, 0.0, 180.0),
+    "正交 · 左视": ViewPreset(ORTHOGRAPHIC_LABEL, 0.0, 90.0),
+    "正交 · 右视": ViewPreset(ORTHOGRAPHIC_LABEL, 0.0, -90.0),
+    "正交 · 俯视": ViewPreset(ORTHOGRAPHIC_LABEL, 90.0, 0.0),
+    "正交 · 等轴测": ViewPreset(ORTHOGRAPHIC_LABEL, 35.264, 45.0),
+    "正交 · 反向等轴测": ViewPreset(ORTHOGRAPHIC_LABEL, 35.264, -135.0),
+}
+
+
+def sample_rotation_to_camera(
+    rotation_x: float, rotation_y: float, rotation_z: float
+) -> tuple[float, float, float]:
+    return rotation_x, rotation_y - 90.0, rotation_z
+
+
+def _normalize_angle(angle: float) -> float:
+    normalized = (angle + 180.0) % 360.0 - 180.0
+    return 180.0 if np.isclose(normalized, -180.0) and angle > 0 else normalized
+
+
+def camera_to_sample_rotation(
+    elevation: float, azimuth: float, roll: float
+) -> tuple[float, float, float]:
+    return (
+        _normalize_angle(elevation),
+        _normalize_angle(azimuth + 90.0),
+        _normalize_angle(roll),
+    )
 
 # Matplotlib does not have a hardware depth buffer for its 3-D artists.  If the
 # sample, grid and water are separate collections, it can only sort those whole
@@ -246,6 +295,9 @@ class Infrared3DApp(tk.Tk):
         self.source_format = ""
         self.ax = None
         self._update_job: str | None = None
+        self._view_update_job: str | None = None
+        self._syncing_view_controls = False
+        self._current_box_aspect: tuple[float, float, float] | None = None
         self._color_buttons: dict[str, tk.Button] = {}
         self.refinement_level = 0
 
@@ -277,6 +329,12 @@ class Infrared3DApp(tk.Tk):
         self.y_scale_var = tk.DoubleVar(value=1.0)
         self.vertical_scale_var = tk.DoubleVar(value=1.0)
         self.view_preset_var = tk.StringVar(value=DEFAULT_VIEW_NAME)
+        default_view = VIEW_PRESETS[DEFAULT_VIEW_NAME]
+        self.projection_var = tk.StringVar(value=default_view.projection)
+        self.rotation_x_var = tk.DoubleVar(value=default_view.rotation_x)
+        self.rotation_y_var = tk.DoubleVar(value=default_view.rotation_y)
+        self.rotation_z_var = tk.DoubleVar(value=default_view.rotation_z)
+        self.view_zoom_var = tk.DoubleVar(value=default_view.zoom_percent)
         self.dpi_var = tk.IntVar(value=300)
         self.export_transparent_var = tk.BooleanVar(value=True)
         self.source_var = tk.StringVar(value="尚未加载数据")
@@ -554,7 +612,7 @@ class Infrared3DApp(tk.Tk):
         ).grid(row=row, column=0, sticky="w", pady=(0, 10))
         row += 1
 
-        row = self._section_title(controls, row, "显示与导出")
+        row = self._section_title(controls, row, "整体显示比例")
         row = self._labeled_spinbox(
             controls,
             row,
@@ -596,6 +654,7 @@ class Infrared3DApp(tk.Tk):
         )
         row += 1
 
+        row = self._section_title(controls, row, "定量视角")
         view_wrapper = ttk.Frame(controls, style="Panel.TFrame")
         view_wrapper.grid(row=row, column=0, sticky="ew", pady=(0, 8))
         view_wrapper.columnconfigure(1, weight=1)
@@ -605,12 +664,47 @@ class Infrared3DApp(tk.Tk):
         view_box = ttk.Combobox(
             view_wrapper,
             textvariable=self.view_preset_var,
-            values=tuple(VIEW_PRESETS),
+            values=(*VIEW_PRESETS, CUSTOM_VIEW_NAME),
             state="readonly",
             width=22,
         )
         view_box.grid(row=0, column=1, sticky="ew")
         view_box.bind("<<ComboboxSelected>>", self.apply_view_preset)
+        row += 1
+
+        projection_wrapper = ttk.Frame(controls, style="Panel.TFrame")
+        projection_wrapper.grid(row=row, column=0, sticky="ew", pady=(0, 8))
+        projection_wrapper.columnconfigure(1, weight=1)
+        ttk.Label(projection_wrapper, text="投影模式", style="Panel.TLabel").grid(
+            row=0, column=0, sticky="w", padx=(0, 12)
+        )
+        ttk.Combobox(
+            projection_wrapper,
+            textvariable=self.projection_var,
+            values=tuple(PROJECTION_MODES),
+            state="readonly",
+            width=22,
+        ).grid(row=0, column=1, sticky="ew")
+        row += 1
+
+        row = self._labeled_spinbox(
+            controls, row, "样品 X 旋转", self.rotation_x_var, -180.0, 180.0, 1.0, "°"
+        )
+        row = self._labeled_spinbox(
+            controls, row, "样品 Y 旋转", self.rotation_y_var, -180.0, 180.0, 1.0, "°"
+        )
+        row = self._labeled_spinbox(
+            controls, row, "样品 Z 旋转", self.rotation_z_var, -180.0, 180.0, 1.0, "°"
+        )
+        row = self._labeled_spinbox(
+            controls, row, "视图缩放比例", self.view_zoom_var, 20.0, 300.0, 5.0, "%"
+        )
+        ttk.Label(
+            controls,
+            text="0° / 0° / 0° 为正视；X 为俯仰、Y 为水平旋转、Z 为画面滚转。拖动后数值会自动同步。",
+            style="Hint.TLabel",
+            wraplength=380,
+        ).grid(row=row, column=0, sticky="w", pady=(0, 9))
         row += 1
 
         cube_views = ttk.Frame(controls, style="Panel.TFrame")
@@ -635,6 +729,7 @@ class Infrared3DApp(tk.Tk):
             )
         row += 1
 
+        row = self._section_title(controls, row, "导出")
         row = self._labeled_spinbox(
             controls, row, "导出分辨率", self.dpi_var, 72, 1200, 10, "DPI"
         )
@@ -684,7 +779,7 @@ class Infrared3DApp(tk.Tk):
         top.columnconfigure(0, weight=1)
         ttk.Label(
             top,
-            text="按住鼠标左键拖动旋转 · 滚轮缩放 · 导出保留当前视角",
+            text="左键拖动旋转并同步角度 · 滚轮缩放 · 数字视角可精确复现",
             style="Hint.TLabel",
         ).grid(row=0, column=0, sticky="w")
         ttk.Label(top, textvariable=self.status_var, style="Hint.TLabel").grid(
@@ -705,6 +800,8 @@ class Infrared3DApp(tk.Tk):
         self.toolbar = NavigationToolbar2Tk(self.canvas, toolbar_host, pack_toolbar=False)
         self.toolbar.update()
         self.toolbar.pack(side=tk.LEFT, padx=6, pady=3)
+        self.canvas.mpl_connect("button_release_event", self._on_view_interaction_end)
+        self.canvas.mpl_connect("scroll_event", self._on_scroll_zoom)
 
     def _section_title(self, parent: ttk.Frame, row: int, text: str) -> int:
         ttk.Separator(parent).grid(row=row, column=0, sticky="ew", pady=(8, 12))
@@ -817,6 +914,14 @@ class Infrared3DApp(tk.Tk):
         )
         for variable in variables:
             variable.trace_add("write", self._schedule_update)
+        for variable in (
+            self.projection_var,
+            self.rotation_x_var,
+            self.rotation_y_var,
+            self.rotation_z_var,
+            self.view_zoom_var,
+        ):
+            variable.trace_add("write", self._schedule_view_update)
 
     def _schedule_update(self, *_args: object) -> None:
         if self.raw_data is None:
@@ -824,6 +929,14 @@ class Infrared3DApp(tk.Tk):
         if self._update_job is not None:
             self.after_cancel(self._update_job)
         self._update_job = self.after(350, self.update_plot)
+
+    def _schedule_view_update(self, *_args: object) -> None:
+        if self._syncing_view_controls or self.ax is None:
+            return
+        self.view_preset_var.set(CUSTOM_VIEW_NAME)
+        if self._view_update_job is not None:
+            self.after_cancel(self._view_update_job)
+        self._view_update_job = self.after(120, self._run_scheduled_view_update)
 
     def refine_once(self) -> None:
         if self.raw_data is None:
@@ -979,8 +1092,12 @@ class Infrared3DApp(tk.Tk):
         if self.raw_data is None:
             return
 
+        if reset_camera:
+            self._set_view_controls_from_preset(DEFAULT_VIEW_NAME)
+
         try:
             settings = self._read_settings()
+            projection, camera, view_zoom = self._read_numeric_view()
             cropped = crop_temperature(self.raw_data, settings.crop_mode)
             factor = 2**self.refinement_level
             projected_rows = (cropped.shape[0] - 1) * factor + 1
@@ -1003,16 +1120,6 @@ class Infrared3DApp(tk.Tk):
         except (ValueError, tk.TclError) as exc:
             self.status_var.set(str(exc))
             return
-
-        camera = VIEW_PRESETS[DEFAULT_VIEW_NAME]
-        if reset_camera:
-            self.view_preset_var.set(DEFAULT_VIEW_NAME)
-        elif self.ax is not None:
-            camera = (
-                float(getattr(self.ax, "elev", camera[0])),
-                float(getattr(self.ax, "azim", camera[1])),
-                float(getattr(self.ax, "roll", camera[2])),
-            )
 
         display_rows = plot_data.shape[0] if self.refinement_level > 0 else 160
         display_columns = plot_data.shape[1] if self.refinement_level > 0 else 160
@@ -1069,7 +1176,9 @@ class Infrared3DApp(tk.Tk):
         self.ax.set_xlim(float(np.min(x)), float(np.max(x)))
         self.ax.set_ylim(float(np.min(y)), float(np.max(y)))
         self.ax.set_zlim(z_min, z_max)
-        self.ax.set_box_aspect((display_x, display_y, z_box))
+        self._current_box_aspect = (display_x, display_y, z_box)
+        self.ax.set_box_aspect(self._current_box_aspect, zoom=view_zoom)
+        self.ax.set_proj_type(projection)
         self.ax.set_axis_off()
         self.ax.view_init(elev=camera[0], azim=camera[1], roll=camera[2])
         self.ax.margins(0)
@@ -1317,16 +1426,116 @@ class Infrared3DApp(tk.Tk):
         self.view_preset_var.set(name)
         self.apply_view_preset()
 
+    def _read_numeric_view(
+        self,
+    ) -> tuple[str, tuple[float, float, float], float]:
+        projection_label = self.projection_var.get()
+        if projection_label not in PROJECTION_MODES:
+            raise ValueError("请选择透视投影或正交投影。")
+        rotation_x = float(self.rotation_x_var.get())
+        rotation_y = float(self.rotation_y_var.get())
+        rotation_z = float(self.rotation_z_var.get())
+        if not all(
+            -180.0 <= angle <= 180.0
+            for angle in (rotation_x, rotation_y, rotation_z)
+        ):
+            raise ValueError("样品 X/Y/Z 旋转角必须在 −180°–180° 之间。")
+        zoom_percent = float(self.view_zoom_var.get())
+        if not 20.0 <= zoom_percent <= 300.0:
+            raise ValueError("视图缩放比例必须在 20%–300% 之间。")
+        return (
+            PROJECTION_MODES[projection_label],
+            sample_rotation_to_camera(rotation_x, rotation_y, rotation_z),
+            zoom_percent / 100.0,
+        )
+
+    def _set_view_controls_from_preset(self, name: str) -> None:
+        preset = VIEW_PRESETS.get(name)
+        if preset is None:
+            return
+        if self._view_update_job is not None:
+            self.after_cancel(self._view_update_job)
+            self._view_update_job = None
+        self._syncing_view_controls = True
+        try:
+            self.view_preset_var.set(name)
+            self.projection_var.set(preset.projection)
+            self.rotation_x_var.set(preset.rotation_x)
+            self.rotation_y_var.set(preset.rotation_y)
+            self.rotation_z_var.set(preset.rotation_z)
+            self.view_zoom_var.set(preset.zoom_percent)
+        finally:
+            self._syncing_view_controls = False
+
     def apply_view_preset(self, _event: object | None = None) -> None:
+        name = self.view_preset_var.get()
+        if name not in VIEW_PRESETS:
+            return
+        self._set_view_controls_from_preset(name)
+        if self.ax is not None:
+            self._apply_numeric_view(update_status=False)
+        self.status_var.set(f"已切换视角：{name}")
+
+    def _run_scheduled_view_update(self) -> None:
+        self._view_update_job = None
+        self._apply_numeric_view()
+
+    def _apply_numeric_view(self, update_status: bool = True) -> None:
         if self.ax is None:
             return
-        name = self.view_preset_var.get()
-        camera = VIEW_PRESETS.get(name)
-        if camera is None:
+        if self._view_update_job is not None:
+            self.after_cancel(self._view_update_job)
+            self._view_update_job = None
+        try:
+            projection, camera, view_zoom = self._read_numeric_view()
+        except (ValueError, tk.TclError) as exc:
+            self.status_var.set(str(exc))
             return
+        self.ax.set_proj_type(projection)
+        if self._current_box_aspect is not None:
+            self.ax.set_box_aspect(self._current_box_aspect, zoom=view_zoom)
         self.ax.view_init(elev=camera[0], azim=camera[1], roll=camera[2])
         self.canvas.draw_idle()
-        self.status_var.set(f"已切换视角：{name}")
+        if update_status:
+            projection_name = self.projection_var.get().replace("投影", "")
+            self.status_var.set(
+                f"定量视角：X {self.rotation_x_var.get():g}° · "
+                f"Y {self.rotation_y_var.get():g}° · Z {self.rotation_z_var.get():g}° · "
+                f"{projection_name} · {self.view_zoom_var.get():g}%"
+            )
+
+    def _on_view_interaction_end(self, event: object) -> None:
+        if self.ax is None or getattr(event, "inaxes", None) is not self.ax:
+            return
+        button = getattr(event, "button", None)
+        if getattr(button, "value", button) != 1:
+            return
+        rotation = camera_to_sample_rotation(
+            float(self.ax.elev), float(self.ax.azim), float(self.ax.roll)
+        )
+        self._syncing_view_controls = True
+        try:
+            self.view_preset_var.set(CUSTOM_VIEW_NAME)
+            self.rotation_x_var.set(round(rotation[0], 2))
+            self.rotation_y_var.set(round(rotation[1], 2))
+            self.rotation_z_var.set(round(rotation[2], 2))
+        finally:
+            self._syncing_view_controls = False
+        self.status_var.set("已同步拖动后的样品旋转角度")
+
+    def _on_scroll_zoom(self, event: object) -> None:
+        if self.ax is None or getattr(event, "inaxes", None) is not self.ax:
+            return
+        direction = getattr(event, "button", None)
+        step = float(getattr(event, "step", 0.0) or 0.0)
+        factor = 1.1 if direction == "up" or step > 0 else 1.0 / 1.1
+        try:
+            current = float(self.view_zoom_var.get())
+        except (ValueError, tk.TclError):
+            current = 100.0
+        new_zoom = min(300.0, max(20.0, current * factor))
+        self.view_zoom_var.set(round(new_zoom, 1))
+        self._apply_numeric_view()
 
     def reset_view(self) -> None:
         self.set_view_preset(DEFAULT_VIEW_NAME)
