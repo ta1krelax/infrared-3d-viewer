@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.log
+
+build/
+dist/
+release/
+
+/.pytest_cache/
+/.mypy_cache/
+
+# Keep only the current README preview at repository root.
+/*.png
+!v1.7_transparent_export_preview.png
+/*.tif
+/*.tiff
+

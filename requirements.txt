@@ -1,0 +1,5 @@
+numpy>=1.26
+matplotlib>=3.8
+pillow>=10.0
+tifffile>=2024.8
+imagecodecs>=2024.6
