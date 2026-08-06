@@ -16,11 +16,9 @@ from app import (  # noqa: E402
     DEFAULT_VIEW_NAME,
     Infrared3DApp,
     RenderSettings,
-    SAMPLE_SURFACE_ZORDER,
+    SCENE_SURFACE_ZORDER,
     VIEW_PRESETS,
-    WATER_BOTTOM_ZORDER,
-    WATER_SIDE_ZORDER,
-    WATER_TOP_ZORDER,
+    _SceneMesh,
 )
 
 
@@ -44,15 +42,16 @@ class _CanvasStub:
 
 
 class WaterRenderingTests(unittest.TestCase):
-    def test_water_faces_share_material_and_render_after_sample(self) -> None:
+    def test_scene_faces_share_one_depth_sorted_collection(self) -> None:
         renderer = object.__new__(Infrared3DApp)
         figure = Figure(figsize=(4, 3))
         renderer.ax = figure.add_subplot(111, projection="3d", computed_zorder=False)
 
-        coordinates = np.linspace(-1.0, 1.0, 3)
+        coordinates = np.linspace(-1.0, 1.0, 4)
         xx, yy = np.meshgrid(coordinates, coordinates)
-        raw = np.full((3, 3), 24.0)
-        display = np.full((3, 3), 24.6)
+        raw = np.full((4, 4), 24.0)
+        raw[1:3, 1:3] = 26.0
+        display = raw.copy()
         waterline = 25.0
         settings = RenderSettings(
             crop_mode="none",
@@ -67,21 +66,22 @@ class WaterRenderingTests(unittest.TestCase):
             above_alpha=1.0,
             below_color=(0.4, 0.4, 0.4),
             below_brightness=1.0,
-            below_alpha=1.0,
+            below_alpha=0.62,
             water_color=(1.0, 0.0, 0.0),
             water_brightness=1.0,
             water_alpha=0.37,
             gradient_enabled=False,
             gradient_strength=0.0,
             gradient_gamma=1.0,
-            show_grid=False,
+            show_grid=True,
             grid_count=10,
             show_solid_walls=False,
             show_water_edges=False,
         )
 
+        scene = _SceneMesh()
         sample_base = renderer._draw_sample(
-            xx, yy, display, raw, waterline, settings
+            xx, yy, display, raw, waterline, settings, scene
         )
         renderer._draw_glass_water(
             xx,
@@ -91,25 +91,28 @@ class WaterRenderingTests(unittest.TestCase):
             raw,
             sample_base,
             settings,
+            scene,
         )
+        renderer.ax.add_collection3d(scene.to_collection())
 
-        collections_by_zorder = {
-            collection.get_zorder(): collection for collection in renderer.ax.collections
-        }
-        self.assertIn(SAMPLE_SURFACE_ZORDER, collections_by_zorder)
-        self.assertIn(WATER_BOTTOM_ZORDER, collections_by_zorder)
-        self.assertIn(WATER_SIDE_ZORDER, collections_by_zorder)
-        self.assertIn(WATER_TOP_ZORDER, collections_by_zorder)
-        self.assertLess(SAMPLE_SURFACE_ZORDER, WATER_BOTTOM_ZORDER)
-        self.assertLess(WATER_BOTTOM_ZORDER, WATER_SIDE_ZORDER)
-        self.assertLess(WATER_SIDE_ZORDER, WATER_TOP_ZORDER)
+        # The opaque sample, translucent water and grid must not be separate
+        # collections: collection-level painter ordering is what allowed rear
+        # water/grid geometry to show through a 100%-opaque front peak.
+        self.assertEqual(len(renderer.ax.collections), 1)
+        collection = renderer.ax.collections[0]
+        self.assertEqual(collection.get_zorder(), SCENE_SURFACE_ZORDER)
 
         expected_rgb = np.array([1.0, 0.0, 0.0])
-        for zorder in (WATER_BOTTOM_ZORDER, WATER_SIDE_ZORDER, WATER_TOP_ZORDER):
-            colors = collections_by_zorder[zorder].get_facecolors()
-            expected_colors = np.repeat(expected_rgb[None, :], len(colors), axis=0)
-            np.testing.assert_allclose(colors[:, :3], expected_colors, atol=1e-12)
-            np.testing.assert_allclose(colors[:, 3], 0.37, atol=1e-12)
+        colors = collection.get_facecolors()
+        water_colors = colors[np.isclose(colors[:, 3], 0.37)]
+        self.assertGreater(len(water_colors), 0)
+        np.testing.assert_allclose(
+            water_colors[:, :3],
+            np.repeat(expected_rgb[None, :], len(water_colors), axis=0),
+            atol=1e-12,
+        )
+        self.assertTrue(np.any(np.isclose(colors[:, 3], 1.0)))
+        self.assertTrue(np.any(np.isclose(collection.get_edgecolors()[:, 3], 0.38)))
 
     def test_view_presets_apply_angles_without_rebuilding_plot(self) -> None:
         renderer = object.__new__(Infrared3DApp)
