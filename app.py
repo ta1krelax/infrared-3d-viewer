@@ -53,17 +53,115 @@ VIEW_PRESETS: dict[str, tuple[float, float, float]] = {
     "低角度透视": (15.0, -55.0, 0.0),
 }
 
-# Matplotlib's automatic 3-D painter sorting works at collection level.  A
-# sample collection containing tall peaks can therefore be drawn after the
-# (geometrically higher) water surface and hide/tarnish the translucent water
-# in only part of the image.  The renderer uses a fixed opaque-to-transparent
-# pass order instead: solid first, then every face of the water volume.
-SAMPLE_SURFACE_ZORDER = 10
-SAMPLE_WALL_ZORDER = 11
-WATER_BOTTOM_ZORDER = 20
-WATER_SIDE_ZORDER = 21
-WATER_TOP_ZORDER = 22
-WATER_EDGE_ZORDER = 23
+# Matplotlib does not have a hardware depth buffer for its 3-D artists.  If the
+# sample, grid and water are separate collections, it can only sort those whole
+# collections and a rear translucent surface may be painted over a front
+# opaque peak.  All scene polygons therefore live in one collection so they
+# are depth-sorted face by face for every camera angle.
+SCENE_SURFACE_ZORDER = 10
+
+
+class _SceneMesh:
+    """Collect surfaces and line segments into one depth-sorted 3-D artist."""
+
+    def __init__(self) -> None:
+        self._faces: list[np.ndarray] = []
+        self._facecolors: list[np.ndarray] = []
+        self._edgecolors: list[np.ndarray] = []
+
+    def add_faces(
+        self,
+        faces: np.ndarray | list[list[tuple[float, float, float]]],
+        facecolors: np.ndarray | tuple[float, float, float, float],
+        edgecolors: np.ndarray | tuple[float, float, float, float] = (0, 0, 0, 0),
+    ) -> None:
+        face_array = np.asarray(faces, dtype=float)
+        if face_array.size == 0:
+            return
+        if face_array.ndim != 3 or face_array.shape[1:] != (4, 3):
+            raise ValueError("3-D scene faces must have shape (n, 4, 3).")
+
+        count = face_array.shape[0]
+        face_color_array = np.asarray(facecolors, dtype=float)
+        if face_color_array.ndim == 1:
+            face_color_array = np.broadcast_to(face_color_array, (count, 4)).copy()
+        edge_color_array = np.asarray(edgecolors, dtype=float)
+        if edge_color_array.ndim == 1:
+            edge_color_array = np.broadcast_to(edge_color_array, (count, 4)).copy()
+        if face_color_array.shape != (count, 4) or edge_color_array.shape != (count, 4):
+            raise ValueError("Every scene face must have one RGBA face and edge color.")
+
+        self._faces.append(face_array)
+        self._facecolors.append(face_color_array)
+        self._edgecolors.append(edge_color_array)
+
+    def add_surface(
+        self,
+        xx: np.ndarray,
+        yy: np.ndarray,
+        zz: np.ndarray,
+        vertex_colors: np.ndarray | tuple[float, float, float, float],
+    ) -> None:
+        """Append valid grid cells as quads, averaging their vertex colors."""
+        points = np.stack((xx, yy, zz), axis=-1)
+        faces = np.stack(
+            (
+                points[:-1, :-1],
+                points[:-1, 1:],
+                points[1:, 1:],
+                points[1:, :-1],
+            ),
+            axis=2,
+        )
+        valid = np.all(np.isfinite(faces), axis=(2, 3))
+        if not np.any(valid):
+            return
+
+        colors = np.asarray(vertex_colors, dtype=float)
+        if colors.ndim == 1:
+            cell_colors = np.broadcast_to(colors, (*valid.shape, 4))
+        else:
+            cell_colors = 0.25 * (
+                colors[:-1, :-1]
+                + colors[:-1, 1:]
+                + colors[1:, 1:]
+                + colors[1:, :-1]
+            )
+        self.add_faces(faces[valid], cell_colors[valid])
+
+    def add_polyline(
+        self,
+        x: np.ndarray | list[float],
+        y: np.ndarray | list[float],
+        z: np.ndarray | list[float],
+        color: tuple[float, float, float, float],
+    ) -> None:
+        """Append each line segment as a degenerate quad for shared sorting."""
+        points = np.column_stack((x, y, z)).astype(float, copy=False)
+        if len(points) < 2:
+            return
+        valid = np.all(np.isfinite(points[:-1]), axis=1) & np.all(
+            np.isfinite(points[1:]), axis=1
+        )
+        if not np.any(valid):
+            return
+        start = points[:-1][valid]
+        end = points[1:][valid]
+        faces = np.stack((start, end, end, start), axis=1)
+        self.add_faces(faces, (0, 0, 0, 0), color)
+
+    def to_collection(self) -> Poly3DCollection:
+        if not self._faces:
+            raise ValueError("The 3-D scene contains no faces.")
+        return Poly3DCollection(
+            np.concatenate(self._faces, axis=0),
+            facecolors=np.concatenate(self._facecolors, axis=0),
+            edgecolors=np.concatenate(self._edgecolors, axis=0),
+            linewidths=0.42,
+            antialiaseds=False,
+            zsort="average",
+            zorder=SCENE_SURFACE_ZORDER,
+        )
 
 
 @dataclass(frozen=True)
@@ -930,12 +1028,12 @@ class Infrared3DApp(tk.Tk):
         xx, yy = np.meshgrid(x, y)
 
         self.figure.clear()
-        # Transparent 3-D collections must be composited after the opaque
-        # sample.  Automatic collection-level sorting is unstable for a water
-        # plane intersected by many peaks, so use the explicit material order
-        # defined above.  It remains stable while the user rotates the view.
+        # Keep every face and grid segment in a single collection.  Matplotlib
+        # can then depth-sort the actual geometry instead of painting whole
+        # materials in a fixed order.
         self.ax = self.figure.add_subplot(111, projection="3d", computed_zorder=False)
         self.ax.set_facecolor("#f4f6f8")
+        scene = _SceneMesh()
         sample_base = self._draw_sample(
             xx,
             yy,
@@ -943,6 +1041,7 @@ class Infrared3DApp(tk.Tk):
             raw_small,
             result.waterline_temperature,
             settings,
+            scene,
         )
         water_bottom, water_top = self._draw_glass_water(
             xx,
@@ -952,7 +1051,9 @@ class Infrared3DApp(tk.Tk):
             raw_small,
             sample_base,
             settings,
+            scene,
         )
+        self.ax.add_collection3d(scene.to_collection())
 
         x_span = max(float(np.ptp(x)), refined_pixel_size)
         y_span = max(float(np.ptp(y)), refined_pixel_size)
@@ -965,6 +1066,8 @@ class Infrared3DApp(tk.Tk):
             z_span * settings.vertical_scale,
             max(display_x, display_y) * 0.002,
         )
+        self.ax.set_xlim(float(np.min(x)), float(np.max(x)))
+        self.ax.set_ylim(float(np.min(y)), float(np.max(y)))
         self.ax.set_zlim(z_min, z_max)
         self.ax.set_box_aspect((display_x, display_y, z_box))
         self.ax.set_axis_off()
@@ -996,6 +1099,7 @@ class Infrared3DApp(tk.Tk):
         raw: np.ndarray,
         waterline: float,
         settings: RenderSettings,
+        scene: _SceneMesh,
     ) -> float:
         normalized_height = z - float(np.min(z))
         height_span = float(np.ptp(normalized_height))
@@ -1029,32 +1133,25 @@ class Infrared3DApp(tk.Tk):
         alpha = np.where(submerged, settings.below_alpha, settings.above_alpha)
         rgba = np.concatenate([rgb, alpha[..., None]], axis=2)
 
-        self.ax.plot_surface(
-            xx,
-            yy,
-            z,
-            facecolors=rgba,
-            linewidth=0,
-            antialiased=False,
-            shade=False,
-            rstride=1,
-            cstride=1,
-            zorder=SAMPLE_SURFACE_ZORDER,
-        )
+        scene.add_surface(xx, yy, z, rgba)
 
         if settings.show_grid:
             row_stride = max(1, int(np.ceil(z.shape[0] / settings.grid_count)))
             column_stride = max(1, int(np.ceil(z.shape[1] / settings.grid_count)))
-            self.ax.plot_wireframe(
-                xx,
-                yy,
-                z + max(float(np.ptp(z)), 0.01) * 0.001,
-                rstride=row_stride,
-                cstride=column_stride,
-                color=(0.08, 0.10, 0.12, 0.38),
-                linewidth=0.42,
-                zorder=SAMPLE_WALL_ZORDER + 1,
-            )
+            grid_z = z + max(float(np.ptp(z)), 0.01) * 0.001
+            row_positions = list(range(0, z.shape[0], row_stride))
+            column_positions = list(range(0, z.shape[1], column_stride))
+            if row_positions[-1] != z.shape[0] - 1:
+                row_positions.append(z.shape[0] - 1)
+            if column_positions[-1] != z.shape[1] - 1:
+                column_positions.append(z.shape[1] - 1)
+            grid_color = (0.08, 0.10, 0.12, 0.38)
+            for row in row_positions:
+                scene.add_polyline(xx[row], yy[row], grid_z[row], grid_color)
+            for column in column_positions:
+                scene.add_polyline(
+                    xx[:, column], yy[:, column], grid_z[:, column], grid_color
+                )
 
         z_range = max(float(np.ptp(z)), 0.01)
         base_z = float(np.min(z)) - 0.12 * z_range
@@ -1095,27 +1192,21 @@ class Infrared3DApp(tk.Tk):
                 wall_alpha = settings.below_alpha if is_below else settings.above_alpha
                 wall_colors.append((*wall_rgb, wall_alpha))
 
-        wall_collection = Poly3DCollection(
+        scene.add_faces(
             walls,
-            facecolors=wall_colors,
-            edgecolors=(0.15, 0.17, 0.19, 0.12),
-            linewidths=0.15,
-            zorder=SAMPLE_WALL_ZORDER,
+            np.asarray(wall_colors),
+            (0.15, 0.17, 0.19, 0.12),
         )
-        self.ax.add_collection3d(wall_collection)
         bottom_rgb = np.clip(below_base * 0.62, 0.0, 1.0)
-        bottom = Poly3DCollection(
+        scene.add_faces(
             [[
                 (xx[0, 0], yy[0, 0], base_z),
                 (xx[0, -1], yy[0, -1], base_z),
                 (xx[-1, -1], yy[-1, -1], base_z),
                 (xx[-1, 0], yy[-1, 0], base_z),
             ]],
-            facecolors=[(*bottom_rgb, settings.below_alpha)],
-            edgecolors="none",
-            zorder=SAMPLE_WALL_ZORDER,
+            (*bottom_rgb, settings.below_alpha),
         )
-        self.ax.add_collection3d(bottom)
         return base_z
 
     def _draw_glass_water(
@@ -1127,6 +1218,7 @@ class Infrared3DApp(tk.Tk):
         raw_surface: np.ndarray,
         sample_base: float,
         settings: RenderSettings,
+        scene: _SceneMesh,
     ) -> tuple[float, float]:
         # The water footprint is intentionally identical to the solid footprint.
         # It must not extend around or below the sample boundary.
@@ -1159,18 +1251,7 @@ class Infrared3DApp(tk.Tk):
         water_rgba[..., :3] = base_rgb
         water_rgba[..., 3] = settings.water_alpha
         if np.any(np.isfinite(water_z_visible)):
-            self.ax.plot_surface(
-                water_xx,
-                water_yy,
-                water_z_visible,
-                facecolors=water_rgba,
-                linewidth=0,
-                antialiased=True,
-                shade=False,
-                rstride=1,
-                cstride=1,
-                zorder=WATER_TOP_ZORDER,
-            )
+            scene.add_surface(water_xx, water_yy, water_z_visible, water_rgba)
 
         water_bottom = sample_base
         side_faces: list[list[tuple[float, float, float]]] = []
@@ -1192,40 +1273,23 @@ class Infrared3DApp(tk.Tk):
                     ]
                 )
                 side_colors.append((*base_rgb, settings.water_alpha))
-        side_collection = Poly3DCollection(
-            side_faces,
-            facecolors=side_colors,
-            edgecolors="none",
-            linewidths=0,
-            zorder=WATER_SIDE_ZORDER,
-        )
-        self.ax.add_collection3d(side_collection)
+        scene.add_faces(side_faces, np.asarray(side_colors))
 
-        bottom_face = Poly3DCollection(
+        scene.add_faces(
             [[
                 (water_x[0], water_y[0], water_bottom),
                 (water_x[-1], water_y[0], water_bottom),
                 (water_x[-1], water_y[-1], water_bottom),
                 (water_x[0], water_y[-1], water_bottom),
             ]],
-            facecolors=[(*base_rgb, settings.water_alpha)],
-            edgecolors="none",
-            zorder=WATER_BOTTOM_ZORDER,
+            (*base_rgb, settings.water_alpha),
         )
-        self.ax.add_collection3d(bottom_face)
 
         if settings.show_water_edges:
             edge_rgb = np.clip(base_rgb * 0.85 + 0.15, 0.0, 1.0)
             edge_color = (*edge_rgb, settings.water_alpha)
             for edge_x, edge_y, edge_z in perimeter:
-                self.ax.plot(
-                    edge_x,
-                    edge_y,
-                    edge_z,
-                    color=edge_color,
-                    linewidth=0.85,
-                    zorder=WATER_EDGE_ZORDER,
-                )
+                scene.add_polyline(edge_x, edge_y, edge_z, edge_color)
             corners = [
                 (water_x[0], water_y[0], water_z[0, 0]),
                 (water_x[-1], water_y[0], water_z[0, -1]),
@@ -1233,13 +1297,11 @@ class Infrared3DApp(tk.Tk):
                 (water_x[0], water_y[-1], water_z[-1, 0]),
             ]
             for corner_x, corner_y, corner_z in corners:
-                self.ax.plot(
+                scene.add_polyline(
                     [corner_x, corner_x],
                     [corner_y, corner_y],
                     [water_bottom, corner_z],
-                    color=edge_color,
-                    linewidth=0.75,
-                    zorder=WATER_EDGE_ZORDER,
+                    edge_color,
                 )
 
         visible_top = (

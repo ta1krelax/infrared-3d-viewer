@@ -29,14 +29,14 @@ if not %errorlevel%==0 (
 )
 
 if not exist "release" mkdir "release"
-copy /y "dist\Infrared3DViewer.exe" "release\Infrared3DViewer_v1.7.exe" >nul
+copy /y "dist\Infrared3DViewer.exe" "release\Infrared3DViewer_v1.8.exe" >nul
 copy /y "使用说明.txt" "release\使用说明.txt" >nul
 
-powershell -NoProfile -Command "Compress-Archive -LiteralPath 'release\Infrared3DViewer_v1.7.exe','release\使用说明.txt' -DestinationPath 'release\Infrared3DViewer_v1.7_Windows_x64.zip' -Force"
-copy /y "release\Infrared3DViewer_v1.7_Windows_x64.zip" "release\Infrared3DViewer_Windows_x64.zip" >nul
+powershell -NoProfile -Command "Compress-Archive -LiteralPath 'release\Infrared3DViewer_v1.8.exe','release\使用说明.txt' -DestinationPath 'release\Infrared3DViewer_v1.8_Windows_x64.zip' -Force"
+copy /y "release\Infrared3DViewer_v1.8_Windows_x64.zip" "release\Infrared3DViewer_Windows_x64.zip" >nul
 
 echo.
 echo 构建完成：
-echo   release\Infrared3DViewer_v1.7.exe
-echo   release\Infrared3DViewer_v1.7_Windows_x64.zip
+echo   release\Infrared3DViewer_v1.8.exe
+echo   release\Infrared3DViewer_v1.8_Windows_x64.zip
 pause
