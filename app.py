@@ -1384,15 +1384,13 @@ class Infrared3DApp(tk.Tk):
                 side_colors.append((*base_rgb, settings.water_alpha))
         scene.add_faces(side_faces, np.asarray(side_colors))
 
-        scene.add_faces(
-            [[
-                (water_x[0], water_y[0], water_bottom),
-                (water_x[-1], water_y[0], water_bottom),
-                (water_x[-1], water_y[-1], water_bottom),
-                (water_x[0], water_y[-1], water_bottom),
-            ]],
-            (*base_rgb, settings.water_alpha),
-        )
+        # Do not add a horizontal face at ``water_bottom``.  That face would be
+        # completely hidden below the sample in a real scene, but it used to be
+        # one footprint-sized translucent quad.  Matplotlib sorts a polygon by
+        # one average depth, so at near-horizontal views half of that enormous
+        # rear quad could be painted over a foreground dry peak.  The water top
+        # and its four perimeter walls already provide the intended glass-like
+        # volume without introducing an invisible layer that can leak through.
 
         if settings.show_water_edges:
             edge_rgb = np.clip(base_rgb * 0.85 + 0.15, 0.0, 1.0)

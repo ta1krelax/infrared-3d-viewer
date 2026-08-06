@@ -118,6 +118,20 @@ class WaterRenderingTests(unittest.TestCase):
         self.assertTrue(np.any(np.isclose(colors[:, 3], 1.0)))
         self.assertTrue(np.any(np.isclose(collection.get_edgecolors()[:, 3], 0.38)))
 
+        faces = np.concatenate(scene._faces, axis=0)
+        facecolors = np.concatenate(scene._facecolors, axis=0)
+        is_water = np.isclose(facecolors[:, 3], settings.water_alpha) & np.all(
+            np.isclose(facecolors[:, :3], settings.water_color), axis=1
+        )
+        water_faces = faces[is_water]
+        hidden_bottom = np.all(
+            np.isclose(water_faces[:, :, 2], sample_base), axis=1
+        )
+        self.assertFalse(
+            np.any(hidden_bottom),
+            "A footprint-sized water-bottom face can sort over dry sample peaks.",
+        )
+
     @staticmethod
     def _make_view_renderer(preset_name: str) -> Infrared3DApp:
         renderer = object.__new__(Infrared3DApp)
