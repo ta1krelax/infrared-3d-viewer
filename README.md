@@ -12,8 +12,8 @@
 
 Windows 下双击 `run_gui.bat`。脚本会优先使用 `py -3`，缺少组件时自动安装 `requirements.txt` 中的依赖。
 
-无需 Python 的 v1.10 分享版本位于 `release/Infrared3DViewer_v1.10.exe`；压缩分享包为
-`release/Infrared3DViewer_v1.10_Windows_x64.zip`。如需重新打包，双击 `build_exe.bat`。
+无需 Python 的 v1.11 分享版本位于 `release/Infrared3DViewer_v1.11.exe`；压缩分享包为
+`release/Infrared3DViewer_v1.11_Windows_x64.zip`。如需重新打包，双击 `build_exe.bat`。
 
 也可以在命令行运行：
 
@@ -82,6 +82,8 @@ X、Y、Z 显示比例可以独立设置，且只改变画面纵横比。“扁�
 ## 中央 1/3
 
 默认在 X 和 Y 两个方向都保留中央 1/3 区域。例如 `120 × 90` 的图像会保留约 `40 × 30` 的中央区域。GUI 也可以改成仅截 X、仅截 Y 或不截取。
+
+点击“选择裁剪区域…”会打开原始温度图预览窗口。可以拖动框内区域移动裁剪框，拖动四角或四边控制点调整尺寸，也可以直接输入 X、Y、宽度和高度；在框外拖动可重新框选。“全图”和“中央 1/3”按钮可快速重置范围。应用后，3D 预览、水面边界细化以及随图导出的 `_cropped_source` 数据均使用同一组精确像素边界。读取新的源文件时，旧文件的自定义区域会自动清除。
 
 ## 浸泡与红外吸收模型
 

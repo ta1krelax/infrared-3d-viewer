@@ -8,6 +8,7 @@ import tkinter as tk
 from tkinter import colorchooser, filedialog, messagebox, ttk
 
 import numpy as np
+from PIL import Image, ImageTk
 
 import matplotlib
 
@@ -19,21 +20,26 @@ from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
 from core import (
     apply_immersion_absorption,
+    crop_bounds_for_mode,
     crop_temperature,
     downsample_grid,
     load_temperature_file,
     make_demo_data,
     refine_temperature_grid,
     save_cropped_source_copy,
+    validate_crop_bounds,
 )
 
 
 APP_TITLE = "红外温度 · 3D 浸泡示意图"
+DEFAULT_CROP_LABEL = "中央 1/3（X、Y）"
+CUSTOM_CROP_LABEL = "自定义区域"
 CROP_LABELS = {
-    "中央 1/3（X、Y）": "xy",
+    DEFAULT_CROP_LABEL: "xy",
     "仅 X 方向中央 1/3": "x",
     "仅 Y 方向中央 1/3": "y",
     "不截取": "none",
+    CUSTOM_CROP_LABEL: "custom",
 }
 MAX_REFINEMENT_LEVEL = 6
 MAX_REFINED_POINTS = 90_000
@@ -283,6 +289,320 @@ def save_figure_image(
     return output
 
 
+class CropSelectionDialog(tk.Toplevel):
+    """Modal original-data preview with a movable, resizable pixel crop box."""
+
+    PREVIEW_WIDTH = 760
+    PREVIEW_HEIGHT = 480
+    HANDLE_RADIUS = 5
+    MIN_SIZE = 2
+
+    def __init__(
+        self,
+        parent: tk.Misc,
+        values: np.ndarray,
+        initial_bounds: tuple[int, int, int, int],
+    ) -> None:
+        super().__init__(parent)
+        self.title("选择裁剪区域")
+        self.configure(background="#f7f8fa")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+
+        self.values = np.asarray(values, dtype=float)
+        self.rows, self.columns = self.values.shape
+        row_start, row_stop, column_start, column_stop = validate_crop_bounds(
+            initial_bounds, self.values.shape
+        )
+        self.bounds = [column_start, row_start, column_stop, row_stop]
+        self.result: tuple[int, int, int, int] | None = None
+        self._drag_mode: str | None = None
+        self._drag_start = (0, 0)
+        self._drag_bounds = self.bounds.copy()
+        self._syncing_numeric = False
+
+        outer = ttk.Frame(self, padding=14)
+        outer.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(
+            outer,
+            text="拖动框内区域可移动；拖动八个控制点可改变尺寸；在框外拖动可重新框选。",
+            wraplength=self.PREVIEW_WIDTH,
+            justify=tk.LEFT,
+        ).pack(anchor="w", pady=(0, 8))
+
+        self.canvas = tk.Canvas(
+            outer,
+            width=self.PREVIEW_WIDTH,
+            height=self.PREVIEW_HEIGHT,
+            background="#20252b",
+            highlightthickness=1,
+            highlightbackground="#aab4be",
+            cursor="crosshair",
+        )
+        self.canvas.pack()
+        self._build_preview_image()
+        self.selection_id = self.canvas.create_rectangle(
+            0, 0, 1, 1, outline="#00e5ff", width=2
+        )
+        self.handle_ids = {
+            name: self.canvas.create_rectangle(
+                0,
+                0,
+                1,
+                1,
+                fill="#ffffff",
+                outline="#007c91",
+                width=1,
+            )
+            for name in ("nw", "n", "ne", "e", "se", "s", "sw", "w")
+        }
+        self.canvas.bind("<ButtonPress-1>", self._on_press)
+        self.canvas.bind("<B1-Motion>", self._on_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._on_release)
+
+        numeric = ttk.LabelFrame(outer, text="像素裁剪范围", padding=(10, 8))
+        numeric.pack(fill=tk.X, pady=(10, 0))
+        self.x_var = tk.IntVar()
+        self.y_var = tk.IntVar()
+        self.width_var = tk.IntVar()
+        self.height_var = tk.IntVar()
+        fields = (
+            ("X", self.x_var, 0, max(0, self.columns - self.MIN_SIZE)),
+            ("Y", self.y_var, 0, max(0, self.rows - self.MIN_SIZE)),
+            ("宽度", self.width_var, self.MIN_SIZE, self.columns),
+            ("高度", self.height_var, self.MIN_SIZE, self.rows),
+        )
+        for column, (label, variable, minimum, maximum) in enumerate(fields):
+            ttk.Label(numeric, text=label).grid(row=0, column=column * 2, padx=(0, 4))
+            spinbox = ttk.Spinbox(
+                numeric,
+                textvariable=variable,
+                from_=minimum,
+                to=maximum,
+                increment=1,
+                width=8,
+                command=self._apply_numeric,
+            )
+            spinbox.grid(row=0, column=column * 2 + 1, padx=(0, 12))
+            spinbox.bind("<Return>", self._apply_numeric)
+            spinbox.bind("<FocusOut>", self._apply_numeric)
+        numeric.columnconfigure(8, weight=1)
+        self.size_label = ttk.Label(numeric)
+        self.size_label.grid(row=0, column=8, sticky="e")
+
+        buttons = ttk.Frame(outer)
+        buttons.pack(fill=tk.X, pady=(12, 0))
+        ttk.Button(buttons, text="全图", command=self._select_full).pack(side=tk.LEFT)
+        ttk.Button(buttons, text="中央 1/3", command=self._select_middle).pack(
+            side=tk.LEFT, padx=(8, 0)
+        )
+        ttk.Button(buttons, text="取消", command=self._cancel).pack(side=tk.RIGHT)
+        ttk.Button(buttons, text="应用裁剪", command=self._confirm).pack(
+            side=tk.RIGHT, padx=(0, 8)
+        )
+
+        self._draw_selection()
+        self.update_idletasks()
+        parent_x = parent.winfo_rootx()
+        parent_y = parent.winfo_rooty()
+        x = parent_x + max(0, (parent.winfo_width() - self.winfo_width()) // 2)
+        y = parent_y + max(0, (parent.winfo_height() - self.winfo_height()) // 2)
+        self.geometry(f"+{x}+{y}")
+        self.grab_set()
+
+    def _build_preview_image(self) -> None:
+        finite = self.values[np.isfinite(self.values)]
+        low, high = np.percentile(finite, (1.0, 99.0))
+        if not np.isfinite(low) or not np.isfinite(high) or high <= low:
+            low = float(np.min(finite))
+            high = float(np.max(finite))
+        span = max(high - low, 1e-12)
+        normalized = np.clip((self.values - low) / span, 0.0, 1.0)
+        rgb = matplotlib.colormaps["inferno"](normalized, bytes=True)[..., :3]
+        preview = Image.fromarray(rgb, mode="RGB")
+        scale = min(
+            self.PREVIEW_WIDTH / self.columns,
+            self.PREVIEW_HEIGHT / self.rows,
+        )
+        display_width = max(1, int(round(self.columns * scale)))
+        display_height = max(1, int(round(self.rows * scale)))
+        preview = preview.resize(
+            (display_width, display_height), Image.Resampling.BILINEAR
+        )
+        self.scale_x = display_width / self.columns
+        self.scale_y = display_height / self.rows
+        self.origin_x = 0.5 * (self.PREVIEW_WIDTH - display_width)
+        self.origin_y = 0.5 * (self.PREVIEW_HEIGHT - display_height)
+        self.preview_photo = ImageTk.PhotoImage(preview, master=self)
+        self.canvas.create_image(
+            self.origin_x,
+            self.origin_y,
+            image=self.preview_photo,
+            anchor="nw",
+        )
+
+    def _image_to_canvas(self, x: int, y: int) -> tuple[float, float]:
+        return self.origin_x + x * self.scale_x, self.origin_y + y * self.scale_y
+
+    def _canvas_to_image(self, x: float, y: float) -> tuple[int, int]:
+        image_x = int(round((x - self.origin_x) / self.scale_x))
+        image_y = int(round((y - self.origin_y) / self.scale_y))
+        return (
+            min(self.columns, max(0, image_x)),
+            min(self.rows, max(0, image_y)),
+        )
+
+    def _draw_selection(self) -> None:
+        x0, y0, x1, y1 = self.bounds
+        left, top = self._image_to_canvas(x0, y0)
+        right, bottom = self._image_to_canvas(x1, y1)
+        self.canvas.coords(self.selection_id, left, top, right, bottom)
+        positions = {
+            "nw": (left, top),
+            "n": ((left + right) / 2, top),
+            "ne": (right, top),
+            "e": (right, (top + bottom) / 2),
+            "se": (right, bottom),
+            "s": ((left + right) / 2, bottom),
+            "sw": (left, bottom),
+            "w": (left, (top + bottom) / 2),
+        }
+        radius = self.HANDLE_RADIUS
+        for name, (center_x, center_y) in positions.items():
+            self.canvas.coords(
+                self.handle_ids[name],
+                center_x - radius,
+                center_y - radius,
+                center_x + radius,
+                center_y + radius,
+            )
+        self._sync_numeric()
+
+    def _sync_numeric(self) -> None:
+        self._syncing_numeric = True
+        x0, y0, x1, y1 = self.bounds
+        self.x_var.set(x0)
+        self.y_var.set(y0)
+        self.width_var.set(x1 - x0)
+        self.height_var.set(y1 - y0)
+        self.size_label.configure(
+            text=f"原图 {self.columns} × {self.rows} px"
+        )
+        self._syncing_numeric = False
+
+    def _apply_numeric(self, _event: tk.Event | None = None) -> None:
+        if self._syncing_numeric:
+            return
+        try:
+            x0 = int(self.x_var.get())
+            y0 = int(self.y_var.get())
+            width = int(self.width_var.get())
+            height = int(self.height_var.get())
+        except (ValueError, tk.TclError):
+            return
+        width = min(self.columns, max(self.MIN_SIZE, width))
+        height = min(self.rows, max(self.MIN_SIZE, height))
+        x0 = min(self.columns - width, max(0, x0))
+        y0 = min(self.rows - height, max(0, y0))
+        self.bounds = [x0, y0, x0 + width, y0 + height]
+        self._draw_selection()
+
+    def _hit_handle(self, canvas_x: float, canvas_y: float) -> str | None:
+        tolerance = self.HANDLE_RADIUS + 3
+        for name, item_id in self.handle_ids.items():
+            left, top, right, bottom = self.canvas.coords(item_id)
+            center_x = 0.5 * (left + right)
+            center_y = 0.5 * (top + bottom)
+            if abs(canvas_x - center_x) <= tolerance and abs(canvas_y - center_y) <= tolerance:
+                return name
+        return None
+
+    def _on_press(self, event: tk.Event) -> None:
+        image_x, image_y = self._canvas_to_image(event.x, event.y)
+        self._drag_start = (image_x, image_y)
+        self._drag_bounds = self.bounds.copy()
+        handle = self._hit_handle(event.x, event.y)
+        if handle is not None:
+            self._drag_mode = handle
+            return
+        x0, y0, x1, y1 = self.bounds
+        if x0 <= image_x <= x1 and y0 <= image_y <= y1:
+            self._drag_mode = "move"
+        else:
+            self._drag_mode = "new"
+
+    @staticmethod
+    def _minimum_interval(start: int, stop: int, limit: int) -> tuple[int, int]:
+        low, high = sorted((start, stop))
+        if high - low >= CropSelectionDialog.MIN_SIZE:
+            return low, high
+        high = min(limit, low + CropSelectionDialog.MIN_SIZE)
+        low = max(0, high - CropSelectionDialog.MIN_SIZE)
+        return low, high
+
+    def _on_drag(self, event: tk.Event) -> None:
+        if self._drag_mode is None:
+            return
+        image_x, image_y = self._canvas_to_image(event.x, event.y)
+        start_x, start_y = self._drag_start
+        x0, y0, x1, y1 = self._drag_bounds
+        if self._drag_mode == "move":
+            width, height = x1 - x0, y1 - y0
+            new_x0 = min(self.columns - width, max(0, x0 + image_x - start_x))
+            new_y0 = min(self.rows - height, max(0, y0 + image_y - start_y))
+            self.bounds = [new_x0, new_y0, new_x0 + width, new_y0 + height]
+        elif self._drag_mode == "new":
+            new_x0, new_x1 = self._minimum_interval(start_x, image_x, self.columns)
+            new_y0, new_y1 = self._minimum_interval(start_y, image_y, self.rows)
+            self.bounds = [new_x0, new_y0, new_x1, new_y1]
+        else:
+            if "w" in self._drag_mode:
+                x0 = min(image_x, x1 - self.MIN_SIZE)
+            if "e" in self._drag_mode:
+                x1 = max(image_x, x0 + self.MIN_SIZE)
+            if "n" in self._drag_mode:
+                y0 = min(image_y, y1 - self.MIN_SIZE)
+            if "s" in self._drag_mode:
+                y1 = max(image_y, y0 + self.MIN_SIZE)
+            self.bounds = [
+                min(self.columns - self.MIN_SIZE, max(0, x0)),
+                min(self.rows - self.MIN_SIZE, max(0, y0)),
+                min(self.columns, max(self.MIN_SIZE, x1)),
+                min(self.rows, max(self.MIN_SIZE, y1)),
+            ]
+        self._draw_selection()
+
+    def _on_release(self, _event: tk.Event) -> None:
+        self._drag_mode = None
+
+    def _select_full(self) -> None:
+        self.bounds = [0, 0, self.columns, self.rows]
+        self._draw_selection()
+
+    def _select_middle(self) -> None:
+        row_start, row_stop, column_start, column_stop = crop_bounds_for_mode(
+            self.values.shape, "xy"
+        )
+        self.bounds = [column_start, row_start, column_stop, row_stop]
+        self._draw_selection()
+
+    def _confirm(self) -> None:
+        self._apply_numeric()
+        x0, y0, x1, y1 = self.bounds
+        self.result = validate_crop_bounds((y0, y1, x0, x1), self.values.shape)
+        self.grab_release()
+        self.destroy()
+
+    def _cancel(self) -> None:
+        self.result = None
+        try:
+            self.grab_release()
+        except tk.TclError:
+            pass
+        self.destroy()
+
+
 class Infrared3DApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -294,6 +614,7 @@ class Infrared3DApp(tk.Tk):
         self.raw_data: np.ndarray | None = None
         self.source_name = ""
         self.source_format = ""
+        self.custom_crop_bounds: tuple[int, int, int, int] | None = None
         self.ax = None
         self._update_job: str | None = None
         self._view_update_job: str | None = None
@@ -302,7 +623,8 @@ class Infrared3DApp(tk.Tk):
         self._color_buttons: dict[str, tk.Button] = {}
         self.refinement_level = 0
 
-        self.crop_var = tk.StringVar(value="中央 1/3（X、Y）")
+        self.crop_var = tk.StringVar(value=DEFAULT_CROP_LABEL)
+        self.crop_info_var = tk.StringVar(value="等待加载数据")
         self.pixel_size_var = tk.DoubleVar(value=0.01)
         self.immersion_var = tk.DoubleVar(value=90.0)
         self.absorption_var = tk.DoubleVar(value=80.0)
@@ -462,12 +784,27 @@ class Infrared3DApp(tk.Tk):
             row=row, column=0, sticky="w"
         )
         row += 1
+        crop_actions = ttk.Frame(controls, style="Panel.TFrame")
+        crop_actions.grid(row=row, column=0, sticky="ew", pady=(4, 5))
+        crop_actions.columnconfigure(0, weight=1)
         ttk.Combobox(
-            controls,
+            crop_actions,
             textvariable=self.crop_var,
-            values=list(CROP_LABELS),
+            values=[label for label in CROP_LABELS if label != CUSTOM_CROP_LABEL],
             state="readonly",
-        ).grid(row=row, column=0, sticky="ew", pady=(4, 10))
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        ttk.Button(
+            crop_actions,
+            text="选择裁剪区域…",
+            command=self.open_crop_selector,
+        ).grid(row=0, column=1, sticky="ew")
+        row += 1
+        ttk.Label(
+            controls,
+            textvariable=self.crop_info_var,
+            style="Hint.TLabel",
+            wraplength=380,
+        ).grid(row=row, column=0, sticky="w", pady=(0, 10))
         row += 1
         row = self._labeled_spinbox(
             controls, row, "单像素尺寸", self.pixel_size_var, 0.0001, 10.0, 0.001, "mm"
@@ -896,7 +1233,6 @@ class Infrared3DApp(tk.Tk):
 
     def _bind_parameter_updates(self) -> None:
         variables = (
-            self.crop_var,
             self.pixel_size_var,
             self.immersion_var,
             self.absorption_var,
@@ -922,6 +1258,7 @@ class Infrared3DApp(tk.Tk):
         )
         for variable in variables:
             variable.trace_add("write", self._schedule_update)
+        self.crop_var.trace_add("write", self._on_crop_mode_changed)
         for variable in (
             self.projection_var,
             self.rotation_x_var,
@@ -937,6 +1274,65 @@ class Infrared3DApp(tk.Tk):
         if self._update_job is not None:
             self.after_cancel(self._update_job)
         self._update_job = self.after(350, self.update_plot)
+
+    def _on_crop_mode_changed(self, *_args: object) -> None:
+        self._refresh_crop_info()
+        self._schedule_update()
+
+    def _current_crop_bounds(
+        self, crop_mode: str | None = None
+    ) -> tuple[int, int, int, int]:
+        if self.raw_data is None:
+            raise ValueError("请先读取温度数据。")
+        mode = crop_mode or CROP_LABELS[self.crop_var.get()]
+        if mode == "custom":
+            if self.custom_crop_bounds is None:
+                raise ValueError("请先在裁剪选择窗口中确定自定义区域。")
+            return validate_crop_bounds(self.custom_crop_bounds, self.raw_data.shape)
+        return crop_bounds_for_mode(self.raw_data.shape, mode)
+
+    def _crop_current_source(self, crop_mode: str | None = None) -> np.ndarray:
+        if self.raw_data is None:
+            raise ValueError("请先读取温度数据。")
+        mode = crop_mode or CROP_LABELS[self.crop_var.get()]
+        return crop_temperature(
+            self.raw_data,
+            mode,
+            self.custom_crop_bounds if mode == "custom" else None,
+        )
+
+    def _refresh_crop_info(self) -> None:
+        if self.raw_data is None:
+            self.crop_info_var.set("等待加载数据")
+            return
+        try:
+            row_start, row_stop, column_start, column_stop = self._current_crop_bounds()
+        except (ValueError, KeyError):
+            self.crop_info_var.set("尚未选择有效的自定义区域")
+            return
+        self.crop_info_var.set(
+            f"X={column_start}, Y={row_start}, "
+            f"尺寸={column_stop - column_start} × {row_stop - row_start} px"
+        )
+
+    def open_crop_selector(self) -> None:
+        if self.raw_data is None:
+            messagebox.showinfo("没有数据", "请先读取 TXT 或 TIFF。", parent=self)
+            return
+        try:
+            initial_bounds = self._current_crop_bounds()
+        except (ValueError, KeyError):
+            initial_bounds = crop_bounds_for_mode(self.raw_data.shape, "xy")
+        dialog = CropSelectionDialog(self, self.raw_data, initial_bounds)
+        self.wait_window(dialog)
+        if dialog.result is None:
+            return
+        self.custom_crop_bounds = dialog.result
+        self.refinement_level = 0
+        self.refinement_info_var.set("细化次数：0")
+        self.crop_var.set(CUSTOM_CROP_LABEL)
+        self._refresh_crop_info()
+        self.status_var.set("已应用自定义裁剪区域")
 
     def _schedule_view_update(self, *_args: object) -> None:
         if self._syncing_view_controls or self.ax is None:
@@ -958,9 +1354,7 @@ class Infrared3DApp(tk.Tk):
             )
             return
         try:
-            cropped = crop_temperature(
-                self.raw_data, CROP_LABELS[self.crop_var.get()]
-            )
+            cropped = self._crop_current_source()
         except (ValueError, KeyError) as exc:
             messagebox.showerror("无法细化", str(exc), parent=self)
             return
@@ -1024,6 +1418,9 @@ class Infrared3DApp(tk.Tk):
             return False
 
         self.raw_data = loaded.values
+        self.custom_crop_bounds = None
+        if self.crop_var.get() == CUSTOM_CROP_LABEL:
+            self.crop_var.set(DEFAULT_CROP_LABEL)
         self.refinement_level = 0
         self.refinement_info_var.set("细化次数：0")
         self.source_name = str(Path(selected))
@@ -1032,12 +1429,16 @@ class Infrared3DApp(tk.Tk):
         self.source_var.set(
             f"{Path(selected).name}\n{loaded.values.shape[1]} × {loaded.values.shape[0]} px · {loaded.source_format}"
         )
+        self._refresh_crop_info()
         self.status_var.set("已读取数据")
         self.update_plot(reset_camera=True)
         return True
 
     def load_demo(self) -> None:
         self.raw_data = make_demo_data()
+        self.custom_crop_bounds = None
+        if self.crop_var.get() == CUSTOM_CROP_LABEL:
+            self.crop_var.set(DEFAULT_CROP_LABEL)
         self.refinement_level = 0
         self.refinement_info_var.set("细化次数：0")
         self.source_name = "内置示例"
@@ -1046,6 +1447,7 @@ class Infrared3DApp(tk.Tk):
         self.source_var.set(
             f"内置示例\n{self.raw_data.shape[1]} × {self.raw_data.shape[0]} px · 二维温度矩阵"
         )
+        self._refresh_crop_info()
         self.status_var.set("正在生成预览…")
         self.after_idle(lambda: self.update_plot(reset_camera=True))
 
@@ -1106,7 +1508,7 @@ class Infrared3DApp(tk.Tk):
         try:
             settings = self._read_settings()
             projection, camera, view_zoom = self._read_numeric_view()
-            cropped = crop_temperature(self.raw_data, settings.crop_mode)
+            cropped = self._crop_current_source(settings.crop_mode)
             factor = 2**self.refinement_level
             projected_rows = (cropped.shape[0] - 1) * factor + 1
             projected_columns = (cropped.shape[1] - 1) * factor + 1
@@ -1582,9 +1984,7 @@ class Infrared3DApp(tk.Tk):
         source_copy_error: Exception | None = None
         if self.export_cropped_source_var.get():
             try:
-                cropped_source = crop_temperature(
-                    self.raw_data, CROP_LABELS[self.crop_var.get()]
-                )
+                cropped_source = self._crop_current_source()
                 source_copy = save_cropped_source_copy(
                     cropped_source,
                     self.source_name,
