@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 
+import numpy as np
 from matplotlib.figure import Figure
 from matplotlib.patches import Rectangle
 from PIL import Image
@@ -15,6 +16,7 @@ if str(PROJECT) not in sys.path:
     sys.path.insert(0, str(PROJECT))
 
 from app import save_figure_image  # noqa: E402
+from core import save_cropped_source_copy  # noqa: E402
 
 
 class TransparentExportTests(unittest.TestCase):
@@ -53,6 +55,34 @@ class TransparentExportTests(unittest.TestCase):
             with Image.open(output) as image:
                 alpha_min, alpha_max = image.convert("RGBA").getchannel("A").getextrema()
             self.assertEqual((alpha_min, alpha_max), (255, 255))
+
+    def test_cropped_text_copy_uses_image_name_and_never_overwrites(self) -> None:
+        values = np.array([[24.125, 25.25], [26.5, 27.75]])
+        with tempfile.TemporaryDirectory() as folder:
+            image = Path(folder) / "figure.png"
+            first = save_cropped_source_copy(values, "camera.csv", image)
+            second = save_cropped_source_copy(values, "camera.csv", image)
+
+            self.assertEqual(first.name, "figure_cropped_source.csv")
+            self.assertEqual(second.name, "figure_cropped_source_2.csv")
+            np.testing.assert_allclose(np.loadtxt(first, delimiter=","), values)
+            np.testing.assert_allclose(np.loadtxt(second, delimiter=","), values)
+
+    def test_cropped_tiff_copy_is_reloadable_float32(self) -> None:
+        import tifffile
+
+        values = np.array([[24.125, 25.25], [26.5, 27.75]])
+        with tempfile.TemporaryDirectory() as folder:
+            output = save_cropped_source_copy(
+                values,
+                "camera.tiff",
+                Path(folder) / "figure.png",
+            )
+            restored = tifffile.imread(output)
+
+            self.assertEqual(output.name, "figure_cropped_source.tiff")
+            self.assertEqual(restored.dtype, np.float32)
+            np.testing.assert_allclose(restored, values)
 
 
 if __name__ == "__main__":

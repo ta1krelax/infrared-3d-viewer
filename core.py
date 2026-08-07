@@ -227,6 +227,46 @@ def crop_temperature(values: np.ndarray, mode: str = "xy") -> np.ndarray:
     return result
 
 
+def save_cropped_source_copy(
+    values: np.ndarray,
+    source_name: str | Path,
+    image_output: str | Path,
+) -> Path:
+    """Save cropped source values beside an exported image without overwriting."""
+
+    array = np.asarray(values, dtype=float)
+    if array.ndim != 2 or array.size == 0 or not np.all(np.isfinite(array)):
+        raise ValueError("导出的裁剪源数据必须是非空、有限的二维矩阵。")
+
+    source_suffix = Path(source_name).suffix.lower()
+    if source_suffix not in {".txt", ".csv", ".dat", ".tif", ".tiff"}:
+        source_suffix = ".txt"
+
+    image_path = Path(image_output)
+    base = image_path.with_name(f"{image_path.stem}_cropped_source{source_suffix}")
+    output = base
+    copy_number = 2
+    while output.exists():
+        output = base.with_name(f"{base.stem}_{copy_number}{base.suffix}")
+        copy_number += 1
+
+    if source_suffix in {".tif", ".tiff"}:
+        try:
+            import tifffile
+        except ImportError as exc:
+            raise ValueError("导出 TIFF 数据副本需要 tifffile 组件。") from exc
+        tifffile.imwrite(
+            output,
+            array.astype(np.float32),
+            compression="lzw",
+            metadata=None,
+        )
+    else:
+        delimiter = "," if source_suffix == ".csv" else "\t"
+        np.savetxt(output, array, fmt="%.12g", delimiter=delimiter)
+    return output
+
+
 def apply_immersion_absorption(
     temperature: np.ndarray,
     immersion_ratio: float,

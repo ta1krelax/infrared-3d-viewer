@@ -24,6 +24,7 @@ from core import (
     load_temperature_file,
     make_demo_data,
     refine_temperature_grid,
+    save_cropped_source_copy,
 )
 
 
@@ -337,6 +338,7 @@ class Infrared3DApp(tk.Tk):
         self.view_zoom_var = tk.DoubleVar(value=default_view.zoom_percent)
         self.dpi_var = tk.IntVar(value=300)
         self.export_transparent_var = tk.BooleanVar(value=True)
+        self.export_cropped_source_var = tk.BooleanVar(value=True)
         self.source_var = tk.StringVar(value="尚未加载数据")
         self.stats_var = tk.StringVar(value="读取 TXT/TIFF，或先载入内置示例查看效果。")
         self.status_var = tk.StringVar(value="就绪")
@@ -492,7 +494,6 @@ class Infrared3DApp(tk.Tk):
             wraplength=380,
         ).grid(row=row, column=0, sticky="w", pady=(0, 10))
         row += 1
-
         row = self._section_title(controls, row, "水面边界细化")
         ttk.Label(
             controls,
@@ -737,6 +738,13 @@ class Infrared3DApp(tk.Tk):
             controls,
             text="导出透明背景（PNG / TIFF）",
             variable=self.export_transparent_var,
+            style="Panel.TCheckbutton",
+        ).grid(row=row, column=0, sticky="w", pady=(0, 10))
+        row += 1
+        ttk.Checkbutton(
+            controls,
+            text="同时导出当前裁剪范围的源数据副本",
+            variable=self.export_cropped_source_var,
             style="Panel.TCheckbutton",
         ).grid(row=row, column=0, sticky="w", pady=(0, 10))
         row += 1
@@ -1570,9 +1578,42 @@ class Infrared3DApp(tk.Tk):
             self.status_var.set("导出失败")
             return
 
+        source_copy: Path | None = None
+        source_copy_error: Exception | None = None
+        if self.export_cropped_source_var.get():
+            try:
+                cropped_source = crop_temperature(
+                    self.raw_data, CROP_LABELS[self.crop_var.get()]
+                )
+                source_copy = save_cropped_source_copy(
+                    cropped_source,
+                    self.source_name,
+                    output,
+                )
+            except Exception as exc:
+                source_copy_error = exc
+
         background_note = "透明背景" if self.export_transparent_var.get() else "预览背景"
-        self.status_var.set(f"已导出：{output.name}（{background_note}）")
-        messagebox.showinfo("导出完成", f"图像已保存到：\n{output}", parent=self)
+        if source_copy_error is not None:
+            self.status_var.set(f"已导出图像，但源数据副本失败：{output.name}")
+            messagebox.showwarning(
+                "图像已导出",
+                f"图像已保存到：\n{output}\n\n"
+                f"裁剪源数据副本保存失败：\n{source_copy_error}",
+                parent=self,
+            )
+            return
+
+        copy_note = f"\n\n裁剪源数据副本：\n{source_copy}" if source_copy else ""
+        self.status_var.set(
+            f"已导出：{output.name}（{background_note}）"
+            + (f"；数据：{source_copy.name}" if source_copy else "")
+        )
+        messagebox.showinfo(
+            "导出完成",
+            f"图像已保存到：\n{output}{copy_note}",
+            parent=self,
+        )
 
 
 def _enable_high_dpi() -> None:
