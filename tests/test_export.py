@@ -15,7 +15,7 @@ PROJECT = Path(__file__).resolve().parents[1]
 if str(PROJECT) not in sys.path:
     sys.path.insert(0, str(PROJECT))
 
-from app import save_figure_image  # noqa: E402
+from app import DialogDirectories, save_figure_image  # noqa: E402
 from core import save_cropped_source_copy  # noqa: E402
 
 
@@ -38,7 +38,11 @@ class TransparentExportTests(unittest.TestCase):
                 with self.subTest(suffix=suffix):
                     output = Path(folder) / f"transparent{suffix}"
                     save_figure_image(
-                        self._make_figure(), output, dpi=80, transparent_background=True
+                        self._make_figure(),
+                        output,
+                        dpi=80,
+                        transparent_background=True,
+                        size_inches=(2.0, 2.0),
                     )
                     with Image.open(output) as image:
                         alpha = image.convert("RGBA").getchannel("A")
@@ -50,11 +54,67 @@ class TransparentExportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             output = Path(folder) / "opaque.png"
             save_figure_image(
-                self._make_figure(), output, dpi=80, transparent_background=False
+                self._make_figure(),
+                output,
+                dpi=80,
+                transparent_background=False,
+                size_inches=(2.0, 2.0),
             )
             with Image.open(output) as image:
                 alpha_min, alpha_max = image.convert("RGBA").getchannel("A").getextrema()
             self.assertEqual((alpha_min, alpha_max), (255, 255))
+
+    def test_export_pixel_size_uses_fixed_inches_and_dpi_not_preview_size(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            figure = self._make_figure()
+            figure.set_size_inches(11.0, 6.0, forward=False)
+            first = Path(folder) / "first.png"
+            save_figure_image(
+                figure,
+                first,
+                dpi=100,
+                transparent_background=True,
+                size_inches=(4.0, 3.0),
+            )
+            with Image.open(first) as image:
+                self.assertEqual(image.size, (400, 300))
+            np.testing.assert_allclose(figure.get_size_inches(), (11.0, 6.0))
+
+            figure.set_size_inches(5.0, 9.0, forward=False)
+            second = Path(folder) / "second.png"
+            save_figure_image(
+                figure,
+                second,
+                dpi=150,
+                transparent_background=True,
+                size_inches=(4.0, 3.0),
+            )
+            with Image.open(second) as image:
+                self.assertEqual(image.size, (600, 450))
+            np.testing.assert_allclose(figure.get_size_inches(), (5.0, 9.0))
+
+    def test_import_and_export_directories_are_remembered_separately(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            import_directory = root / "input"
+            export_directory = root / "output"
+            next_import_directory = root / "next-input"
+            next_export_directory = root / "next-output"
+            directories = DialogDirectories(import_directory, export_directory)
+
+            directories.remember_export(next_export_directory / "render.png")
+            self.assertEqual(directories.import_directory, import_directory)
+            self.assertEqual(
+                directories.export_directory, next_export_directory.resolve()
+            )
+
+            directories.remember_import(next_import_directory / "thermal.tif")
+            self.assertEqual(
+                directories.import_directory, next_import_directory.resolve()
+            )
+            self.assertEqual(
+                directories.export_directory, next_export_directory.resolve()
+            )
 
     def test_cropped_text_copy_uses_image_name_and_never_overwrites(self) -> None:
         values = np.array([[24.125, 25.25], [26.5, 27.75]])

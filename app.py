@@ -43,6 +43,8 @@ CROP_LABELS = {
 }
 MAX_REFINEMENT_LEVEL = 6
 MAX_REFINED_POINTS = 90_000
+DEFAULT_EXPORT_WIDTH_INCHES = 9.0
+DEFAULT_EXPORT_HEIGHT_INCHES = 7.0
 
 DEFAULT_VIEW_NAME = "常规透视"
 CUSTOM_VIEW_NAME = "自定义数值"
@@ -52,6 +54,25 @@ PROJECTION_MODES = {
     PERSPECTIVE_LABEL: "persp",
     ORTHOGRAPHIC_LABEL: "ortho",
 }
+
+
+@dataclass
+class DialogDirectories:
+    """Keep import and export chooser locations independent within a session."""
+
+    import_directory: Path
+    export_directory: Path
+
+    @classmethod
+    def create_default(cls) -> "DialogDirectories":
+        starting_directory = Path.home()
+        return cls(starting_directory, starting_directory)
+
+    def remember_import(self, selected: str | Path) -> None:
+        self.import_directory = Path(selected).expanduser().resolve().parent
+
+    def remember_export(self, selected: str | Path) -> None:
+        self.export_directory = Path(selected).expanduser().resolve().parent
 
 
 @dataclass(frozen=True)
@@ -256,8 +277,19 @@ def save_figure_image(
     selected: str | Path,
     dpi: int,
     transparent_background: bool,
+    size_inches: tuple[float, float] = (
+        DEFAULT_EXPORT_WIDTH_INCHES,
+        DEFAULT_EXPORT_HEIGHT_INCHES,
+    ),
 ) -> Path:
-    """Save the current view while preserving RGBA transparency when requested."""
+    """Save at a fixed physical size, independent of the interactive canvas."""
+
+    width_inches, height_inches = (float(value) for value in size_inches)
+    if not 1.0 <= width_inches <= 20.0 or not 1.0 <= height_inches <= 20.0:
+        raise ValueError("导出宽度和高度必须在 1–20 英寸之间。")
+    if not 72 <= int(dpi) <= 1200:
+        raise ValueError("导出分辨率必须在 72–1200 DPI 之间。")
+
     output = Path(selected)
     suffix = output.suffix.lower()
     if suffix not in {".png", ".tif", ".tiff"}:
@@ -266,8 +298,10 @@ def save_figure_image(
 
     save_options: dict[str, object] = {
         "dpi": dpi,
-        "bbox_inches": "tight",
-        "pad_inches": 0.02,
+        # A tight bounding box makes the final pixel dimensions depend on the
+        # rendered artist extents.  A fixed figure canvas guarantees exactly
+        # width_inches*dpi by height_inches*dpi pixels instead.
+        "bbox_inches": None,
     }
     if transparent_background:
         # `transparent=True` temporarily makes both the Figure and Axes patches
@@ -285,7 +319,16 @@ def save_figure_image(
         save_options["pil_kwargs"] = {"compression": "tiff_lzw"}
     else:
         save_options["format"] = "png"
-    figure.savefig(output, **save_options)
+
+    preview_size = tuple(float(value) for value in figure.get_size_inches())
+    try:
+        figure.set_size_inches(width_inches, height_inches, forward=False)
+        figure.savefig(output, **save_options)
+    finally:
+        figure.set_size_inches(*preview_size, forward=False)
+        canvas = getattr(figure, "canvas", None)
+        if canvas is not None:
+            canvas.draw_idle()
     return output
 
 
@@ -622,6 +665,7 @@ class Infrared3DApp(tk.Tk):
         self._current_box_aspect: tuple[float, float, float] | None = None
         self._color_buttons: dict[str, tk.Button] = {}
         self.refinement_level = 0
+        self.dialog_directories = DialogDirectories.create_default()
 
         self.crop_var = tk.StringVar(value=DEFAULT_CROP_LABEL)
         self.crop_info_var = tk.StringVar(value="等待加载数据")
@@ -659,6 +703,9 @@ class Infrared3DApp(tk.Tk):
         self.rotation_z_var = tk.DoubleVar(value=default_view.rotation_z)
         self.view_zoom_var = tk.DoubleVar(value=default_view.zoom_percent)
         self.dpi_var = tk.IntVar(value=300)
+        self.export_width_var = tk.DoubleVar(value=DEFAULT_EXPORT_WIDTH_INCHES)
+        self.export_height_var = tk.DoubleVar(value=DEFAULT_EXPORT_HEIGHT_INCHES)
+        self.export_size_info_var = tk.StringVar(value="预计输出：2700 × 2100 px")
         self.export_transparent_var = tk.BooleanVar(value=True)
         self.export_cropped_source_var = tk.BooleanVar(value=True)
         self.source_var = tk.StringVar(value="尚未加载数据")
@@ -1069,8 +1116,20 @@ class Infrared3DApp(tk.Tk):
 
         row = self._section_title(controls, row, "导出")
         row = self._labeled_spinbox(
+            controls, row, "导出宽度", self.export_width_var, 1.0, 20.0, 0.5, "英寸"
+        )
+        row = self._labeled_spinbox(
+            controls, row, "导出高度", self.export_height_var, 1.0, 20.0, 0.5, "英寸"
+        )
+        row = self._labeled_spinbox(
             controls, row, "导出分辨率", self.dpi_var, 72, 1200, 10, "DPI"
         )
+        ttk.Label(
+            controls,
+            textvariable=self.export_size_info_var,
+            style="Hint.TLabel",
+        ).grid(row=row, column=0, sticky="w", pady=(0, 10))
+        row += 1
         ttk.Checkbutton(
             controls,
             text="导出透明背景（PNG / TIFF）",
@@ -1267,6 +1326,34 @@ class Infrared3DApp(tk.Tk):
             self.view_zoom_var,
         ):
             variable.trace_add("write", self._schedule_view_update)
+        for variable in (
+            self.dpi_var,
+            self.export_width_var,
+            self.export_height_var,
+        ):
+            variable.trace_add("write", self._refresh_export_size_info)
+
+    def _read_export_settings(self) -> tuple[int, tuple[float, float]]:
+        dpi = int(self.dpi_var.get())
+        width_inches = float(self.export_width_var.get())
+        height_inches = float(self.export_height_var.get())
+        if not 72 <= dpi <= 1200:
+            raise ValueError("导出分辨率必须在 72–1200 DPI 之间。")
+        if not 1.0 <= width_inches <= 20.0 or not 1.0 <= height_inches <= 20.0:
+            raise ValueError("导出宽度和高度必须在 1–20 英寸之间。")
+        return dpi, (width_inches, height_inches)
+
+    def _refresh_export_size_info(self, *_args: object) -> None:
+        try:
+            dpi, (width_inches, height_inches) = self._read_export_settings()
+        except (ValueError, tk.TclError):
+            self.export_size_info_var.set("预计输出：请输入有效尺寸和 DPI")
+            return
+        width_pixels = int(round(width_inches * dpi))
+        height_pixels = int(round(height_inches * dpi))
+        self.export_size_info_var.set(
+            f"预计输出：{width_pixels} × {height_pixels} px"
+        )
 
     def _schedule_update(self, *_args: object) -> None:
         if self.raw_data is None:
@@ -1397,6 +1484,7 @@ class Infrared3DApp(tk.Tk):
     def open_file(self) -> None:
         selected = filedialog.askopenfilename(
             title="选择红外温度 TXT 或 TIFF",
+            initialdir=str(self.dialog_directories.import_directory),
             filetypes=[
                 ("支持的数据", "*.txt *.csv *.dat *.tif *.tiff"),
                 ("TIFF 图像", "*.tif *.tiff"),
@@ -1406,6 +1494,7 @@ class Infrared3DApp(tk.Tk):
         )
         if not selected:
             return
+        self.dialog_directories.remember_import(selected)
         self.load_path(selected)
 
     def load_path(self, selected: str | Path) -> bool:
@@ -1418,6 +1507,7 @@ class Infrared3DApp(tk.Tk):
             return False
 
         self.raw_data = loaded.values
+        self.dialog_directories.remember_import(selected)
         self.custom_crop_bounds = None
         if self.crop_var.get() == CUSTOM_CROP_LABEL:
             self.crop_var.set(DEFAULT_CROP_LABEL)
@@ -1957,6 +2047,7 @@ class Infrared3DApp(tk.Tk):
             title="导出当前 3D 视角",
             defaultextension=".png",
             initialfile="infrared_3d_illustration.png",
+            initialdir=str(self.dialog_directories.export_directory),
             filetypes=[
                 ("PNG 图像", "*.png"),
                 ("TIFF 图像", "*.tif *.tiff"),
@@ -1964,16 +2055,16 @@ class Infrared3DApp(tk.Tk):
         )
         if not selected:
             return
+        self.dialog_directories.remember_export(selected)
 
         try:
-            dpi = int(self.dpi_var.get())
-            if not 72 <= dpi <= 1200:
-                raise ValueError("导出分辨率必须在 72–1200 DPI 之间。")
+            dpi, size_inches = self._read_export_settings()
             output = save_figure_image(
                 self.figure,
                 selected,
                 dpi,
                 transparent_background=bool(self.export_transparent_var.get()),
+                size_inches=size_inches,
             )
         except Exception as exc:
             messagebox.showerror("导出失败", str(exc), parent=self)

@@ -12,8 +12,8 @@
 
 Windows 下双击 `run_gui.bat`。脚本会优先使用 `py -3`，缺少组件时自动安装 `requirements.txt` 中的依赖。
 
-无需 Python 的 v1.11 分享版本位于 `release/Infrared3DViewer_v1.11.exe`；压缩分享包为
-`release/Infrared3DViewer_v1.11_Windows_x64.zip`。如需重新打包，双击 `build_exe.bat`。
+无需 Python 的 v1.12 分享版本位于 `release/Infrared3DViewer_v1.12.exe`；压缩分享包为
+`release/Infrared3DViewer_v1.12_Windows_x64.zip`。如需重新打包，双击 `build_exe.bat`。
 
 也可以在命令行运行：
 
@@ -109,6 +109,7 @@ Z显示 = T水面 + (T原始 − T水面) × (1 − a)
 - TIFF：LZW 无损压缩，适合后续排版。
 - “导出透明背景（PNG / TIFF）”默认开启，导出 RGBA 图像且背景 Alpha 为 0；样品、水体和抗锯齿边缘保留自身透明度。关闭后恢复预览中的浅色背景。
 - “同时导出当前裁剪范围的源数据副本”默认开启。导出图像时会在同一目录保存 `图像名_cropped_source` 数据文件；TXT/CSV/DAT 保存二维数值矩阵，TIFF 保存为可重新读取的 32-bit float TIFF。若同名文件已存在，会自动添加 `_2`、`_3`，不会覆盖已有数据。
-- DPI 可在 GUI 中设置，默认 300。
+- 导出宽度、高度和 DPI 均可在 GUI 中设置，默认 `9 × 7 英寸、300 DPI`，即固定输出 `2700 × 2100 px`。输出像素只由这三个数值决定，不再随程序窗口或预览画布大小变化；GUI 会实时显示预计像素尺寸。
+- 导入和导出分别记忆各自最近使用的目录。在一个输入目录中连续处理多份数据并输出到另一个目录时，两个文件选择窗口不会再互相改变默认路径。
 
 对于很大的数据，预览会自动等距降采样到最多 `160 × 160` 个显示点，以保证拖动顺畅；计算阈值和界面统计仍使用完整的裁剪后数据。当前 Matplotlib/TkAgg 后端使用 CPU，不能直接启用 GPU；如真实大尺寸数据仍不流畅，可以另做基于 PyVista/VTK 的 GPU 版本，但 EXE 体积会明显增加。

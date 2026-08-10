@@ -1,7 +1,7 @@
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 11, 0, 0),
-    prodvers=(1, 11, 0, 0),
+    filevers=(1, 12, 0, 0),
+    prodvers=(1, 12, 0, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -16,11 +16,11 @@ VSVersionInfo(
         [
           StringStruct(u'CompanyName', u'Infrared Visualization Tools'),
           StringStruct(u'FileDescription', u'Infrared Temperature 3D Immersion Viewer'),
-          StringStruct(u'FileVersion', u'1.11.0'),
+          StringStruct(u'FileVersion', u'1.12.0'),
           StringStruct(u'InternalName', u'Infrared3DViewer'),
           StringStruct(u'OriginalFilename', u'Infrared3DViewer.exe'),
           StringStruct(u'ProductName', u'Infrared 3D Viewer'),
-          StringStruct(u'ProductVersion', u'1.11.0')
+          StringStruct(u'ProductVersion', u'1.12.0')
         ]
       )
     ]),
