@@ -8,6 +8,7 @@ import tkinter as tk
 from tkinter import colorchooser, filedialog, messagebox, ttk
 
 import numpy as np
+from PIL import Image, ImageTk
 
 import matplotlib
 
@@ -19,51 +20,225 @@ from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
 from core import (
     apply_immersion_absorption,
+    crop_bounds_for_mode,
     crop_temperature,
     downsample_grid,
     load_temperature_file,
     make_demo_data,
     refine_temperature_grid,
+    save_cropped_source_copy,
+    validate_crop_bounds,
 )
 
 
 APP_TITLE = "红外温度 · 3D 浸泡示意图"
+DEFAULT_CROP_LABEL = "中央 1/3（X、Y）"
+CUSTOM_CROP_LABEL = "自定义区域"
 CROP_LABELS = {
-    "中央 1/3（X、Y）": "xy",
+    DEFAULT_CROP_LABEL: "xy",
     "仅 X 方向中央 1/3": "x",
     "仅 Y 方向中央 1/3": "y",
     "不截取": "none",
+    CUSTOM_CROP_LABEL: "custom",
 }
 MAX_REFINEMENT_LEVEL = 6
 MAX_REFINED_POINTS = 90_000
+DEFAULT_EXPORT_WIDTH_INCHES = 9.0
+DEFAULT_EXPORT_HEIGHT_INCHES = 7.0
 
 DEFAULT_VIEW_NAME = "常规透视"
-VIEW_PRESETS: dict[str, tuple[float, float, float]] = {
-    DEFAULT_VIEW_NAME: (28.0, -55.0, 0.0),
-    "立方体 · 面（正视）": (0.0, -90.0, 0.0),
-    "立方体 · 棱（双面）": (0.0, -45.0, 0.0),
-    "立方体 · 角（等轴测）": (35.264, -45.0, 0.0),
-    "反向等轴测": (35.264, 135.0, 0.0),
-    "俯视（XY）": (90.0, -90.0, 0.0),
-    "仰视（XY）": (-90.0, -90.0, 0.0),
-    "后视": (0.0, 90.0, 0.0),
-    "左视": (0.0, 0.0, 0.0),
-    "右视": (0.0, 180.0, 0.0),
-    "高角度透视": (55.0, -45.0, 0.0),
-    "低角度透视": (15.0, -55.0, 0.0),
+CUSTOM_VIEW_NAME = "自定义数值"
+PERSPECTIVE_LABEL = "透视投影"
+ORTHOGRAPHIC_LABEL = "正交投影"
+PROJECTION_MODES = {
+    PERSPECTIVE_LABEL: "persp",
+    ORTHOGRAPHIC_LABEL: "ortho",
 }
 
-# Matplotlib's automatic 3-D painter sorting works at collection level.  A
-# sample collection containing tall peaks can therefore be drawn after the
-# (geometrically higher) water surface and hide/tarnish the translucent water
-# in only part of the image.  The renderer uses a fixed opaque-to-transparent
-# pass order instead: solid first, then every face of the water volume.
-SAMPLE_SURFACE_ZORDER = 10
-SAMPLE_WALL_ZORDER = 11
-WATER_BOTTOM_ZORDER = 20
-WATER_SIDE_ZORDER = 21
-WATER_TOP_ZORDER = 22
-WATER_EDGE_ZORDER = 23
+
+@dataclass
+class DialogDirectories:
+    """Keep import and export chooser locations independent within a session."""
+
+    import_directory: Path
+    export_directory: Path
+
+    @classmethod
+    def create_default(cls) -> "DialogDirectories":
+        starting_directory = Path.home()
+        return cls(starting_directory, starting_directory)
+
+    def remember_import(self, selected: str | Path) -> None:
+        self.import_directory = Path(selected).expanduser().resolve().parent
+
+    def remember_export(self, selected: str | Path) -> None:
+        self.export_directory = Path(selected).expanduser().resolve().parent
+
+
+@dataclass(frozen=True)
+class ViewPreset:
+    projection: str
+    rotation_x: float
+    rotation_y: float
+    rotation_z: float = 0.0
+    zoom_percent: float = 100.0
+
+
+# The numeric controls describe sample rotation instead of Matplotlib's camera
+# angles.  A zero rotation is the front face; horizontal sample rotation Y is
+# camera azimuth + 90 degrees.
+VIEW_PRESETS: dict[str, ViewPreset] = {
+    DEFAULT_VIEW_NAME: ViewPreset(PERSPECTIVE_LABEL, 28.0, 35.0),
+    "立方体 · 面（正视）": ViewPreset(PERSPECTIVE_LABEL, 0.0, 0.0),
+    "立方体 · 棱（双面）": ViewPreset(PERSPECTIVE_LABEL, 0.0, 45.0),
+    "立方体 · 角（等轴测）": ViewPreset(PERSPECTIVE_LABEL, 35.264, 45.0),
+    "反向等轴测": ViewPreset(PERSPECTIVE_LABEL, 35.264, -135.0),
+    "俯视（XY）": ViewPreset(PERSPECTIVE_LABEL, 90.0, 0.0),
+    "仰视（XY）": ViewPreset(PERSPECTIVE_LABEL, -90.0, 0.0),
+    "后视": ViewPreset(PERSPECTIVE_LABEL, 0.0, 180.0),
+    "左视": ViewPreset(PERSPECTIVE_LABEL, 0.0, 90.0),
+    "右视": ViewPreset(PERSPECTIVE_LABEL, 0.0, -90.0),
+    "高角度透视": ViewPreset(PERSPECTIVE_LABEL, 55.0, 45.0),
+    "低角度透视": ViewPreset(PERSPECTIVE_LABEL, 15.0, 35.0),
+    "正交 · 正视": ViewPreset(ORTHOGRAPHIC_LABEL, 0.0, 0.0),
+    "正交 · 后视": ViewPreset(ORTHOGRAPHIC_LABEL, 0.0, 180.0),
+    "正交 · 左视": ViewPreset(ORTHOGRAPHIC_LABEL, 0.0, 90.0),
+    "正交 · 右视": ViewPreset(ORTHOGRAPHIC_LABEL, 0.0, -90.0),
+    "正交 · 俯视": ViewPreset(ORTHOGRAPHIC_LABEL, 90.0, 0.0),
+    "正交 · 等轴测": ViewPreset(ORTHOGRAPHIC_LABEL, 35.264, 45.0),
+    "正交 · 反向等轴测": ViewPreset(ORTHOGRAPHIC_LABEL, 35.264, -135.0),
+}
+
+
+def sample_rotation_to_camera(
+    rotation_x: float, rotation_y: float, rotation_z: float
+) -> tuple[float, float, float]:
+    return rotation_x, rotation_y - 90.0, rotation_z
+
+
+def _normalize_angle(angle: float) -> float:
+    normalized = (angle + 180.0) % 360.0 - 180.0
+    return 180.0 if np.isclose(normalized, -180.0) and angle > 0 else normalized
+
+
+def camera_to_sample_rotation(
+    elevation: float, azimuth: float, roll: float
+) -> tuple[float, float, float]:
+    return (
+        _normalize_angle(elevation),
+        _normalize_angle(azimuth + 90.0),
+        _normalize_angle(roll),
+    )
+
+# Matplotlib does not have a hardware depth buffer for its 3-D artists.  If the
+# sample, grid and water are separate collections, it can only sort those whole
+# collections and a rear translucent surface may be painted over a front
+# opaque peak.  All scene polygons therefore live in one collection so they
+# are depth-sorted face by face for every camera angle.
+SCENE_SURFACE_ZORDER = 10
+
+
+class _SceneMesh:
+    """Collect surfaces and line segments into one depth-sorted 3-D artist."""
+
+    def __init__(self) -> None:
+        self._faces: list[np.ndarray] = []
+        self._facecolors: list[np.ndarray] = []
+        self._edgecolors: list[np.ndarray] = []
+
+    def add_faces(
+        self,
+        faces: np.ndarray | list[list[tuple[float, float, float]]],
+        facecolors: np.ndarray | tuple[float, float, float, float],
+        edgecolors: np.ndarray | tuple[float, float, float, float] = (0, 0, 0, 0),
+    ) -> None:
+        face_array = np.asarray(faces, dtype=float)
+        if face_array.size == 0:
+            return
+        if face_array.ndim != 3 or face_array.shape[1:] != (4, 3):
+            raise ValueError("3-D scene faces must have shape (n, 4, 3).")
+
+        count = face_array.shape[0]
+        face_color_array = np.asarray(facecolors, dtype=float)
+        if face_color_array.ndim == 1:
+            face_color_array = np.broadcast_to(face_color_array, (count, 4)).copy()
+        edge_color_array = np.asarray(edgecolors, dtype=float)
+        if edge_color_array.ndim == 1:
+            edge_color_array = np.broadcast_to(edge_color_array, (count, 4)).copy()
+        if face_color_array.shape != (count, 4) or edge_color_array.shape != (count, 4):
+            raise ValueError("Every scene face must have one RGBA face and edge color.")
+
+        self._faces.append(face_array)
+        self._facecolors.append(face_color_array)
+        self._edgecolors.append(edge_color_array)
+
+    def add_surface(
+        self,
+        xx: np.ndarray,
+        yy: np.ndarray,
+        zz: np.ndarray,
+        vertex_colors: np.ndarray | tuple[float, float, float, float],
+    ) -> None:
+        """Append valid grid cells as quads, averaging their vertex colors."""
+        points = np.stack((xx, yy, zz), axis=-1)
+        faces = np.stack(
+            (
+                points[:-1, :-1],
+                points[:-1, 1:],
+                points[1:, 1:],
+                points[1:, :-1],
+            ),
+            axis=2,
+        )
+        valid = np.all(np.isfinite(faces), axis=(2, 3))
+        if not np.any(valid):
+            return
+
+        colors = np.asarray(vertex_colors, dtype=float)
+        if colors.ndim == 1:
+            cell_colors = np.broadcast_to(colors, (*valid.shape, 4))
+        else:
+            cell_colors = 0.25 * (
+                colors[:-1, :-1]
+                + colors[:-1, 1:]
+                + colors[1:, 1:]
+                + colors[1:, :-1]
+            )
+        self.add_faces(faces[valid], cell_colors[valid])
+
+    def add_polyline(
+        self,
+        x: np.ndarray | list[float],
+        y: np.ndarray | list[float],
+        z: np.ndarray | list[float],
+        color: tuple[float, float, float, float],
+    ) -> None:
+        """Append each line segment as a degenerate quad for shared sorting."""
+        points = np.column_stack((x, y, z)).astype(float, copy=False)
+        if len(points) < 2:
+            return
+        valid = np.all(np.isfinite(points[:-1]), axis=1) & np.all(
+            np.isfinite(points[1:]), axis=1
+        )
+        if not np.any(valid):
+            return
+        start = points[:-1][valid]
+        end = points[1:][valid]
+        faces = np.stack((start, end, end, start), axis=1)
+        self.add_faces(faces, (0, 0, 0, 0), color)
+
+    def to_collection(self) -> Poly3DCollection:
+        if not self._faces:
+            raise ValueError("The 3-D scene contains no faces.")
+        return Poly3DCollection(
+            np.concatenate(self._faces, axis=0),
+            facecolors=np.concatenate(self._facecolors, axis=0),
+            edgecolors=np.concatenate(self._edgecolors, axis=0),
+            linewidths=0.42,
+            antialiaseds=False,
+            zsort="average",
+            zorder=SCENE_SURFACE_ZORDER,
+        )
 
 
 @dataclass(frozen=True)
@@ -102,8 +277,19 @@ def save_figure_image(
     selected: str | Path,
     dpi: int,
     transparent_background: bool,
+    size_inches: tuple[float, float] = (
+        DEFAULT_EXPORT_WIDTH_INCHES,
+        DEFAULT_EXPORT_HEIGHT_INCHES,
+    ),
 ) -> Path:
-    """Save the current view while preserving RGBA transparency when requested."""
+    """Save at a fixed physical size, independent of the interactive canvas."""
+
+    width_inches, height_inches = (float(value) for value in size_inches)
+    if not 1.0 <= width_inches <= 20.0 or not 1.0 <= height_inches <= 20.0:
+        raise ValueError("导出宽度和高度必须在 1–20 英寸之间。")
+    if not 72 <= int(dpi) <= 1200:
+        raise ValueError("导出分辨率必须在 72–1200 DPI 之间。")
+
     output = Path(selected)
     suffix = output.suffix.lower()
     if suffix not in {".png", ".tif", ".tiff"}:
@@ -112,8 +298,10 @@ def save_figure_image(
 
     save_options: dict[str, object] = {
         "dpi": dpi,
-        "bbox_inches": "tight",
-        "pad_inches": 0.02,
+        # A tight bounding box makes the final pixel dimensions depend on the
+        # rendered artist extents.  A fixed figure canvas guarantees exactly
+        # width_inches*dpi by height_inches*dpi pixels instead.
+        "bbox_inches": None,
     }
     if transparent_background:
         # `transparent=True` temporarily makes both the Figure and Axes patches
@@ -131,8 +319,331 @@ def save_figure_image(
         save_options["pil_kwargs"] = {"compression": "tiff_lzw"}
     else:
         save_options["format"] = "png"
-    figure.savefig(output, **save_options)
+
+    preview_size = tuple(float(value) for value in figure.get_size_inches())
+    try:
+        figure.set_size_inches(width_inches, height_inches, forward=False)
+        figure.savefig(output, **save_options)
+    finally:
+        figure.set_size_inches(*preview_size, forward=False)
+        canvas = getattr(figure, "canvas", None)
+        if canvas is not None:
+            canvas.draw_idle()
     return output
+
+
+class CropSelectionDialog(tk.Toplevel):
+    """Modal original-data preview with a movable, resizable pixel crop box."""
+
+    PREVIEW_WIDTH = 760
+    PREVIEW_HEIGHT = 480
+    HANDLE_RADIUS = 5
+    MIN_SIZE = 2
+
+    def __init__(
+        self,
+        parent: tk.Misc,
+        values: np.ndarray,
+        initial_bounds: tuple[int, int, int, int],
+    ) -> None:
+        super().__init__(parent)
+        self.title("选择裁剪区域")
+        self.configure(background="#f7f8fa")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+
+        self.values = np.asarray(values, dtype=float)
+        self.rows, self.columns = self.values.shape
+        row_start, row_stop, column_start, column_stop = validate_crop_bounds(
+            initial_bounds, self.values.shape
+        )
+        self.bounds = [column_start, row_start, column_stop, row_stop]
+        self.result: tuple[int, int, int, int] | None = None
+        self._drag_mode: str | None = None
+        self._drag_start = (0, 0)
+        self._drag_bounds = self.bounds.copy()
+        self._syncing_numeric = False
+
+        outer = ttk.Frame(self, padding=14)
+        outer.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(
+            outer,
+            text="拖动框内区域可移动；拖动八个控制点可改变尺寸；在框外拖动可重新框选。",
+            wraplength=self.PREVIEW_WIDTH,
+            justify=tk.LEFT,
+        ).pack(anchor="w", pady=(0, 8))
+
+        self.canvas = tk.Canvas(
+            outer,
+            width=self.PREVIEW_WIDTH,
+            height=self.PREVIEW_HEIGHT,
+            background="#20252b",
+            highlightthickness=1,
+            highlightbackground="#aab4be",
+            cursor="crosshair",
+        )
+        self.canvas.pack()
+        self._build_preview_image()
+        self.selection_id = self.canvas.create_rectangle(
+            0, 0, 1, 1, outline="#00e5ff", width=2
+        )
+        self.handle_ids = {
+            name: self.canvas.create_rectangle(
+                0,
+                0,
+                1,
+                1,
+                fill="#ffffff",
+                outline="#007c91",
+                width=1,
+            )
+            for name in ("nw", "n", "ne", "e", "se", "s", "sw", "w")
+        }
+        self.canvas.bind("<ButtonPress-1>", self._on_press)
+        self.canvas.bind("<B1-Motion>", self._on_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._on_release)
+
+        numeric = ttk.LabelFrame(outer, text="像素裁剪范围", padding=(10, 8))
+        numeric.pack(fill=tk.X, pady=(10, 0))
+        self.x_var = tk.IntVar()
+        self.y_var = tk.IntVar()
+        self.width_var = tk.IntVar()
+        self.height_var = tk.IntVar()
+        fields = (
+            ("X", self.x_var, 0, max(0, self.columns - self.MIN_SIZE)),
+            ("Y", self.y_var, 0, max(0, self.rows - self.MIN_SIZE)),
+            ("宽度", self.width_var, self.MIN_SIZE, self.columns),
+            ("高度", self.height_var, self.MIN_SIZE, self.rows),
+        )
+        for column, (label, variable, minimum, maximum) in enumerate(fields):
+            ttk.Label(numeric, text=label).grid(row=0, column=column * 2, padx=(0, 4))
+            spinbox = ttk.Spinbox(
+                numeric,
+                textvariable=variable,
+                from_=minimum,
+                to=maximum,
+                increment=1,
+                width=8,
+                command=self._apply_numeric,
+            )
+            spinbox.grid(row=0, column=column * 2 + 1, padx=(0, 12))
+            spinbox.bind("<Return>", self._apply_numeric)
+            spinbox.bind("<FocusOut>", self._apply_numeric)
+        numeric.columnconfigure(8, weight=1)
+        self.size_label = ttk.Label(numeric)
+        self.size_label.grid(row=0, column=8, sticky="e")
+
+        buttons = ttk.Frame(outer)
+        buttons.pack(fill=tk.X, pady=(12, 0))
+        ttk.Button(buttons, text="全图", command=self._select_full).pack(side=tk.LEFT)
+        ttk.Button(buttons, text="中央 1/3", command=self._select_middle).pack(
+            side=tk.LEFT, padx=(8, 0)
+        )
+        ttk.Button(buttons, text="取消", command=self._cancel).pack(side=tk.RIGHT)
+        ttk.Button(buttons, text="应用裁剪", command=self._confirm).pack(
+            side=tk.RIGHT, padx=(0, 8)
+        )
+
+        self._draw_selection()
+        self.update_idletasks()
+        parent_x = parent.winfo_rootx()
+        parent_y = parent.winfo_rooty()
+        x = parent_x + max(0, (parent.winfo_width() - self.winfo_width()) // 2)
+        y = parent_y + max(0, (parent.winfo_height() - self.winfo_height()) // 2)
+        self.geometry(f"+{x}+{y}")
+        self.grab_set()
+
+    def _build_preview_image(self) -> None:
+        finite = self.values[np.isfinite(self.values)]
+        low, high = np.percentile(finite, (1.0, 99.0))
+        if not np.isfinite(low) or not np.isfinite(high) or high <= low:
+            low = float(np.min(finite))
+            high = float(np.max(finite))
+        span = max(high - low, 1e-12)
+        normalized = np.clip((self.values - low) / span, 0.0, 1.0)
+        rgb = matplotlib.colormaps["inferno"](normalized, bytes=True)[..., :3]
+        preview = Image.fromarray(rgb, mode="RGB")
+        scale = min(
+            self.PREVIEW_WIDTH / self.columns,
+            self.PREVIEW_HEIGHT / self.rows,
+        )
+        display_width = max(1, int(round(self.columns * scale)))
+        display_height = max(1, int(round(self.rows * scale)))
+        preview = preview.resize(
+            (display_width, display_height), Image.Resampling.BILINEAR
+        )
+        self.scale_x = display_width / self.columns
+        self.scale_y = display_height / self.rows
+        self.origin_x = 0.5 * (self.PREVIEW_WIDTH - display_width)
+        self.origin_y = 0.5 * (self.PREVIEW_HEIGHT - display_height)
+        self.preview_photo = ImageTk.PhotoImage(preview, master=self)
+        self.canvas.create_image(
+            self.origin_x,
+            self.origin_y,
+            image=self.preview_photo,
+            anchor="nw",
+        )
+
+    def _image_to_canvas(self, x: int, y: int) -> tuple[float, float]:
+        return self.origin_x + x * self.scale_x, self.origin_y + y * self.scale_y
+
+    def _canvas_to_image(self, x: float, y: float) -> tuple[int, int]:
+        image_x = int(round((x - self.origin_x) / self.scale_x))
+        image_y = int(round((y - self.origin_y) / self.scale_y))
+        return (
+            min(self.columns, max(0, image_x)),
+            min(self.rows, max(0, image_y)),
+        )
+
+    def _draw_selection(self) -> None:
+        x0, y0, x1, y1 = self.bounds
+        left, top = self._image_to_canvas(x0, y0)
+        right, bottom = self._image_to_canvas(x1, y1)
+        self.canvas.coords(self.selection_id, left, top, right, bottom)
+        positions = {
+            "nw": (left, top),
+            "n": ((left + right) / 2, top),
+            "ne": (right, top),
+            "e": (right, (top + bottom) / 2),
+            "se": (right, bottom),
+            "s": ((left + right) / 2, bottom),
+            "sw": (left, bottom),
+            "w": (left, (top + bottom) / 2),
+        }
+        radius = self.HANDLE_RADIUS
+        for name, (center_x, center_y) in positions.items():
+            self.canvas.coords(
+                self.handle_ids[name],
+                center_x - radius,
+                center_y - radius,
+                center_x + radius,
+                center_y + radius,
+            )
+        self._sync_numeric()
+
+    def _sync_numeric(self) -> None:
+        self._syncing_numeric = True
+        x0, y0, x1, y1 = self.bounds
+        self.x_var.set(x0)
+        self.y_var.set(y0)
+        self.width_var.set(x1 - x0)
+        self.height_var.set(y1 - y0)
+        self.size_label.configure(
+            text=f"原图 {self.columns} × {self.rows} px"
+        )
+        self._syncing_numeric = False
+
+    def _apply_numeric(self, _event: tk.Event | None = None) -> None:
+        if self._syncing_numeric:
+            return
+        try:
+            x0 = int(self.x_var.get())
+            y0 = int(self.y_var.get())
+            width = int(self.width_var.get())
+            height = int(self.height_var.get())
+        except (ValueError, tk.TclError):
+            return
+        width = min(self.columns, max(self.MIN_SIZE, width))
+        height = min(self.rows, max(self.MIN_SIZE, height))
+        x0 = min(self.columns - width, max(0, x0))
+        y0 = min(self.rows - height, max(0, y0))
+        self.bounds = [x0, y0, x0 + width, y0 + height]
+        self._draw_selection()
+
+    def _hit_handle(self, canvas_x: float, canvas_y: float) -> str | None:
+        tolerance = self.HANDLE_RADIUS + 3
+        for name, item_id in self.handle_ids.items():
+            left, top, right, bottom = self.canvas.coords(item_id)
+            center_x = 0.5 * (left + right)
+            center_y = 0.5 * (top + bottom)
+            if abs(canvas_x - center_x) <= tolerance and abs(canvas_y - center_y) <= tolerance:
+                return name
+        return None
+
+    def _on_press(self, event: tk.Event) -> None:
+        image_x, image_y = self._canvas_to_image(event.x, event.y)
+        self._drag_start = (image_x, image_y)
+        self._drag_bounds = self.bounds.copy()
+        handle = self._hit_handle(event.x, event.y)
+        if handle is not None:
+            self._drag_mode = handle
+            return
+        x0, y0, x1, y1 = self.bounds
+        if x0 <= image_x <= x1 and y0 <= image_y <= y1:
+            self._drag_mode = "move"
+        else:
+            self._drag_mode = "new"
+
+    @staticmethod
+    def _minimum_interval(start: int, stop: int, limit: int) -> tuple[int, int]:
+        low, high = sorted((start, stop))
+        if high - low >= CropSelectionDialog.MIN_SIZE:
+            return low, high
+        high = min(limit, low + CropSelectionDialog.MIN_SIZE)
+        low = max(0, high - CropSelectionDialog.MIN_SIZE)
+        return low, high
+
+    def _on_drag(self, event: tk.Event) -> None:
+        if self._drag_mode is None:
+            return
+        image_x, image_y = self._canvas_to_image(event.x, event.y)
+        start_x, start_y = self._drag_start
+        x0, y0, x1, y1 = self._drag_bounds
+        if self._drag_mode == "move":
+            width, height = x1 - x0, y1 - y0
+            new_x0 = min(self.columns - width, max(0, x0 + image_x - start_x))
+            new_y0 = min(self.rows - height, max(0, y0 + image_y - start_y))
+            self.bounds = [new_x0, new_y0, new_x0 + width, new_y0 + height]
+        elif self._drag_mode == "new":
+            new_x0, new_x1 = self._minimum_interval(start_x, image_x, self.columns)
+            new_y0, new_y1 = self._minimum_interval(start_y, image_y, self.rows)
+            self.bounds = [new_x0, new_y0, new_x1, new_y1]
+        else:
+            if "w" in self._drag_mode:
+                x0 = min(image_x, x1 - self.MIN_SIZE)
+            if "e" in self._drag_mode:
+                x1 = max(image_x, x0 + self.MIN_SIZE)
+            if "n" in self._drag_mode:
+                y0 = min(image_y, y1 - self.MIN_SIZE)
+            if "s" in self._drag_mode:
+                y1 = max(image_y, y0 + self.MIN_SIZE)
+            self.bounds = [
+                min(self.columns - self.MIN_SIZE, max(0, x0)),
+                min(self.rows - self.MIN_SIZE, max(0, y0)),
+                min(self.columns, max(self.MIN_SIZE, x1)),
+                min(self.rows, max(self.MIN_SIZE, y1)),
+            ]
+        self._draw_selection()
+
+    def _on_release(self, _event: tk.Event) -> None:
+        self._drag_mode = None
+
+    def _select_full(self) -> None:
+        self.bounds = [0, 0, self.columns, self.rows]
+        self._draw_selection()
+
+    def _select_middle(self) -> None:
+        row_start, row_stop, column_start, column_stop = crop_bounds_for_mode(
+            self.values.shape, "xy"
+        )
+        self.bounds = [column_start, row_start, column_stop, row_stop]
+        self._draw_selection()
+
+    def _confirm(self) -> None:
+        self._apply_numeric()
+        x0, y0, x1, y1 = self.bounds
+        self.result = validate_crop_bounds((y0, y1, x0, x1), self.values.shape)
+        self.grab_release()
+        self.destroy()
+
+    def _cancel(self) -> None:
+        self.result = None
+        try:
+            self.grab_release()
+        except tk.TclError:
+            pass
+        self.destroy()
 
 
 class Infrared3DApp(tk.Tk):
@@ -146,12 +657,18 @@ class Infrared3DApp(tk.Tk):
         self.raw_data: np.ndarray | None = None
         self.source_name = ""
         self.source_format = ""
+        self.custom_crop_bounds: tuple[int, int, int, int] | None = None
         self.ax = None
         self._update_job: str | None = None
+        self._view_update_job: str | None = None
+        self._syncing_view_controls = False
+        self._current_box_aspect: tuple[float, float, float] | None = None
         self._color_buttons: dict[str, tk.Button] = {}
         self.refinement_level = 0
+        self.dialog_directories = DialogDirectories.create_default()
 
-        self.crop_var = tk.StringVar(value="中央 1/3（X、Y）")
+        self.crop_var = tk.StringVar(value=DEFAULT_CROP_LABEL)
+        self.crop_info_var = tk.StringVar(value="等待加载数据")
         self.pixel_size_var = tk.DoubleVar(value=0.01)
         self.immersion_var = tk.DoubleVar(value=90.0)
         self.absorption_var = tk.DoubleVar(value=80.0)
@@ -179,8 +696,18 @@ class Infrared3DApp(tk.Tk):
         self.y_scale_var = tk.DoubleVar(value=1.0)
         self.vertical_scale_var = tk.DoubleVar(value=1.0)
         self.view_preset_var = tk.StringVar(value=DEFAULT_VIEW_NAME)
+        default_view = VIEW_PRESETS[DEFAULT_VIEW_NAME]
+        self.projection_var = tk.StringVar(value=default_view.projection)
+        self.rotation_x_var = tk.DoubleVar(value=default_view.rotation_x)
+        self.rotation_y_var = tk.DoubleVar(value=default_view.rotation_y)
+        self.rotation_z_var = tk.DoubleVar(value=default_view.rotation_z)
+        self.view_zoom_var = tk.DoubleVar(value=default_view.zoom_percent)
         self.dpi_var = tk.IntVar(value=300)
+        self.export_width_var = tk.DoubleVar(value=DEFAULT_EXPORT_WIDTH_INCHES)
+        self.export_height_var = tk.DoubleVar(value=DEFAULT_EXPORT_HEIGHT_INCHES)
+        self.export_size_info_var = tk.StringVar(value="预计输出：2700 × 2100 px")
         self.export_transparent_var = tk.BooleanVar(value=True)
+        self.export_cropped_source_var = tk.BooleanVar(value=True)
         self.source_var = tk.StringVar(value="尚未加载数据")
         self.stats_var = tk.StringVar(value="读取 TXT/TIFF，或先载入内置示例查看效果。")
         self.status_var = tk.StringVar(value="就绪")
@@ -304,12 +831,27 @@ class Infrared3DApp(tk.Tk):
             row=row, column=0, sticky="w"
         )
         row += 1
+        crop_actions = ttk.Frame(controls, style="Panel.TFrame")
+        crop_actions.grid(row=row, column=0, sticky="ew", pady=(4, 5))
+        crop_actions.columnconfigure(0, weight=1)
         ttk.Combobox(
-            controls,
+            crop_actions,
             textvariable=self.crop_var,
-            values=list(CROP_LABELS),
+            values=[label for label in CROP_LABELS if label != CUSTOM_CROP_LABEL],
             state="readonly",
-        ).grid(row=row, column=0, sticky="ew", pady=(4, 10))
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        ttk.Button(
+            crop_actions,
+            text="选择裁剪区域…",
+            command=self.open_crop_selector,
+        ).grid(row=0, column=1, sticky="ew")
+        row += 1
+        ttk.Label(
+            controls,
+            textvariable=self.crop_info_var,
+            style="Hint.TLabel",
+            wraplength=380,
+        ).grid(row=row, column=0, sticky="w", pady=(0, 10))
         row += 1
         row = self._labeled_spinbox(
             controls, row, "单像素尺寸", self.pixel_size_var, 0.0001, 10.0, 0.001, "mm"
@@ -336,7 +878,6 @@ class Infrared3DApp(tk.Tk):
             wraplength=380,
         ).grid(row=row, column=0, sticky="w", pady=(0, 10))
         row += 1
-
         row = self._section_title(controls, row, "水面边界细化")
         ttk.Label(
             controls,
@@ -456,7 +997,7 @@ class Infrared3DApp(tk.Tk):
         ).grid(row=row, column=0, sticky="w", pady=(0, 10))
         row += 1
 
-        row = self._section_title(controls, row, "显示与导出")
+        row = self._section_title(controls, row, "整体显示比例")
         row = self._labeled_spinbox(
             controls,
             row,
@@ -498,6 +1039,7 @@ class Infrared3DApp(tk.Tk):
         )
         row += 1
 
+        row = self._section_title(controls, row, "定量视角")
         view_wrapper = ttk.Frame(controls, style="Panel.TFrame")
         view_wrapper.grid(row=row, column=0, sticky="ew", pady=(0, 8))
         view_wrapper.columnconfigure(1, weight=1)
@@ -507,12 +1049,47 @@ class Infrared3DApp(tk.Tk):
         view_box = ttk.Combobox(
             view_wrapper,
             textvariable=self.view_preset_var,
-            values=tuple(VIEW_PRESETS),
+            values=(*VIEW_PRESETS, CUSTOM_VIEW_NAME),
             state="readonly",
             width=22,
         )
         view_box.grid(row=0, column=1, sticky="ew")
         view_box.bind("<<ComboboxSelected>>", self.apply_view_preset)
+        row += 1
+
+        projection_wrapper = ttk.Frame(controls, style="Panel.TFrame")
+        projection_wrapper.grid(row=row, column=0, sticky="ew", pady=(0, 8))
+        projection_wrapper.columnconfigure(1, weight=1)
+        ttk.Label(projection_wrapper, text="投影模式", style="Panel.TLabel").grid(
+            row=0, column=0, sticky="w", padx=(0, 12)
+        )
+        ttk.Combobox(
+            projection_wrapper,
+            textvariable=self.projection_var,
+            values=tuple(PROJECTION_MODES),
+            state="readonly",
+            width=22,
+        ).grid(row=0, column=1, sticky="ew")
+        row += 1
+
+        row = self._labeled_spinbox(
+            controls, row, "样品 X 旋转", self.rotation_x_var, -180.0, 180.0, 1.0, "°"
+        )
+        row = self._labeled_spinbox(
+            controls, row, "样品 Y 旋转", self.rotation_y_var, -180.0, 180.0, 1.0, "°"
+        )
+        row = self._labeled_spinbox(
+            controls, row, "样品 Z 旋转", self.rotation_z_var, -180.0, 180.0, 1.0, "°"
+        )
+        row = self._labeled_spinbox(
+            controls, row, "视图缩放比例", self.view_zoom_var, 20.0, 300.0, 5.0, "%"
+        )
+        ttk.Label(
+            controls,
+            text="0° / 0° / 0° 为正视；X 为俯仰、Y 为水平旋转、Z 为画面滚转。拖动后数值会自动同步。",
+            style="Hint.TLabel",
+            wraplength=380,
+        ).grid(row=row, column=0, sticky="w", pady=(0, 9))
         row += 1
 
         cube_views = ttk.Frame(controls, style="Panel.TFrame")
@@ -537,13 +1114,33 @@ class Infrared3DApp(tk.Tk):
             )
         row += 1
 
+        row = self._section_title(controls, row, "导出")
+        row = self._labeled_spinbox(
+            controls, row, "导出宽度", self.export_width_var, 1.0, 20.0, 0.5, "英寸"
+        )
+        row = self._labeled_spinbox(
+            controls, row, "导出高度", self.export_height_var, 1.0, 20.0, 0.5, "英寸"
+        )
         row = self._labeled_spinbox(
             controls, row, "导出分辨率", self.dpi_var, 72, 1200, 10, "DPI"
         )
+        ttk.Label(
+            controls,
+            textvariable=self.export_size_info_var,
+            style="Hint.TLabel",
+        ).grid(row=row, column=0, sticky="w", pady=(0, 10))
+        row += 1
         ttk.Checkbutton(
             controls,
             text="导出透明背景（PNG / TIFF）",
             variable=self.export_transparent_var,
+            style="Panel.TCheckbutton",
+        ).grid(row=row, column=0, sticky="w", pady=(0, 10))
+        row += 1
+        ttk.Checkbutton(
+            controls,
+            text="同时导出当前裁剪范围的源数据副本",
+            variable=self.export_cropped_source_var,
             style="Panel.TCheckbutton",
         ).grid(row=row, column=0, sticky="w", pady=(0, 10))
         row += 1
@@ -586,7 +1183,7 @@ class Infrared3DApp(tk.Tk):
         top.columnconfigure(0, weight=1)
         ttk.Label(
             top,
-            text="按住鼠标左键拖动旋转 · 滚轮缩放 · 导出保留当前视角",
+            text="左键拖动旋转并同步角度 · 滚轮缩放 · 数字视角可精确复现",
             style="Hint.TLabel",
         ).grid(row=0, column=0, sticky="w")
         ttk.Label(top, textvariable=self.status_var, style="Hint.TLabel").grid(
@@ -607,6 +1204,8 @@ class Infrared3DApp(tk.Tk):
         self.toolbar = NavigationToolbar2Tk(self.canvas, toolbar_host, pack_toolbar=False)
         self.toolbar.update()
         self.toolbar.pack(side=tk.LEFT, padx=6, pady=3)
+        self.canvas.mpl_connect("button_release_event", self._on_view_interaction_end)
+        self.canvas.mpl_connect("scroll_event", self._on_scroll_zoom)
 
     def _section_title(self, parent: ttk.Frame, row: int, text: str) -> int:
         ttk.Separator(parent).grid(row=row, column=0, sticky="ew", pady=(8, 12))
@@ -693,7 +1292,6 @@ class Infrared3DApp(tk.Tk):
 
     def _bind_parameter_updates(self) -> None:
         variables = (
-            self.crop_var,
             self.pixel_size_var,
             self.immersion_var,
             self.absorption_var,
@@ -719,6 +1317,43 @@ class Infrared3DApp(tk.Tk):
         )
         for variable in variables:
             variable.trace_add("write", self._schedule_update)
+        self.crop_var.trace_add("write", self._on_crop_mode_changed)
+        for variable in (
+            self.projection_var,
+            self.rotation_x_var,
+            self.rotation_y_var,
+            self.rotation_z_var,
+            self.view_zoom_var,
+        ):
+            variable.trace_add("write", self._schedule_view_update)
+        for variable in (
+            self.dpi_var,
+            self.export_width_var,
+            self.export_height_var,
+        ):
+            variable.trace_add("write", self._refresh_export_size_info)
+
+    def _read_export_settings(self) -> tuple[int, tuple[float, float]]:
+        dpi = int(self.dpi_var.get())
+        width_inches = float(self.export_width_var.get())
+        height_inches = float(self.export_height_var.get())
+        if not 72 <= dpi <= 1200:
+            raise ValueError("导出分辨率必须在 72–1200 DPI 之间。")
+        if not 1.0 <= width_inches <= 20.0 or not 1.0 <= height_inches <= 20.0:
+            raise ValueError("导出宽度和高度必须在 1–20 英寸之间。")
+        return dpi, (width_inches, height_inches)
+
+    def _refresh_export_size_info(self, *_args: object) -> None:
+        try:
+            dpi, (width_inches, height_inches) = self._read_export_settings()
+        except (ValueError, tk.TclError):
+            self.export_size_info_var.set("预计输出：请输入有效尺寸和 DPI")
+            return
+        width_pixels = int(round(width_inches * dpi))
+        height_pixels = int(round(height_inches * dpi))
+        self.export_size_info_var.set(
+            f"预计输出：{width_pixels} × {height_pixels} px"
+        )
 
     def _schedule_update(self, *_args: object) -> None:
         if self.raw_data is None:
@@ -726,6 +1361,73 @@ class Infrared3DApp(tk.Tk):
         if self._update_job is not None:
             self.after_cancel(self._update_job)
         self._update_job = self.after(350, self.update_plot)
+
+    def _on_crop_mode_changed(self, *_args: object) -> None:
+        self._refresh_crop_info()
+        self._schedule_update()
+
+    def _current_crop_bounds(
+        self, crop_mode: str | None = None
+    ) -> tuple[int, int, int, int]:
+        if self.raw_data is None:
+            raise ValueError("请先读取温度数据。")
+        mode = crop_mode or CROP_LABELS[self.crop_var.get()]
+        if mode == "custom":
+            if self.custom_crop_bounds is None:
+                raise ValueError("请先在裁剪选择窗口中确定自定义区域。")
+            return validate_crop_bounds(self.custom_crop_bounds, self.raw_data.shape)
+        return crop_bounds_for_mode(self.raw_data.shape, mode)
+
+    def _crop_current_source(self, crop_mode: str | None = None) -> np.ndarray:
+        if self.raw_data is None:
+            raise ValueError("请先读取温度数据。")
+        mode = crop_mode or CROP_LABELS[self.crop_var.get()]
+        return crop_temperature(
+            self.raw_data,
+            mode,
+            self.custom_crop_bounds if mode == "custom" else None,
+        )
+
+    def _refresh_crop_info(self) -> None:
+        if self.raw_data is None:
+            self.crop_info_var.set("等待加载数据")
+            return
+        try:
+            row_start, row_stop, column_start, column_stop = self._current_crop_bounds()
+        except (ValueError, KeyError):
+            self.crop_info_var.set("尚未选择有效的自定义区域")
+            return
+        self.crop_info_var.set(
+            f"X={column_start}, Y={row_start}, "
+            f"尺寸={column_stop - column_start} × {row_stop - row_start} px"
+        )
+
+    def open_crop_selector(self) -> None:
+        if self.raw_data is None:
+            messagebox.showinfo("没有数据", "请先读取 TXT 或 TIFF。", parent=self)
+            return
+        try:
+            initial_bounds = self._current_crop_bounds()
+        except (ValueError, KeyError):
+            initial_bounds = crop_bounds_for_mode(self.raw_data.shape, "xy")
+        dialog = CropSelectionDialog(self, self.raw_data, initial_bounds)
+        self.wait_window(dialog)
+        if dialog.result is None:
+            return
+        self.custom_crop_bounds = dialog.result
+        self.refinement_level = 0
+        self.refinement_info_var.set("细化次数：0")
+        self.crop_var.set(CUSTOM_CROP_LABEL)
+        self._refresh_crop_info()
+        self.status_var.set("已应用自定义裁剪区域")
+
+    def _schedule_view_update(self, *_args: object) -> None:
+        if self._syncing_view_controls or self.ax is None:
+            return
+        self.view_preset_var.set(CUSTOM_VIEW_NAME)
+        if self._view_update_job is not None:
+            self.after_cancel(self._view_update_job)
+        self._view_update_job = self.after(120, self._run_scheduled_view_update)
 
     def refine_once(self) -> None:
         if self.raw_data is None:
@@ -739,9 +1441,7 @@ class Infrared3DApp(tk.Tk):
             )
             return
         try:
-            cropped = crop_temperature(
-                self.raw_data, CROP_LABELS[self.crop_var.get()]
-            )
+            cropped = self._crop_current_source()
         except (ValueError, KeyError) as exc:
             messagebox.showerror("无法细化", str(exc), parent=self)
             return
@@ -784,6 +1484,7 @@ class Infrared3DApp(tk.Tk):
     def open_file(self) -> None:
         selected = filedialog.askopenfilename(
             title="选择红外温度 TXT 或 TIFF",
+            initialdir=str(self.dialog_directories.import_directory),
             filetypes=[
                 ("支持的数据", "*.txt *.csv *.dat *.tif *.tiff"),
                 ("TIFF 图像", "*.tif *.tiff"),
@@ -793,6 +1494,7 @@ class Infrared3DApp(tk.Tk):
         )
         if not selected:
             return
+        self.dialog_directories.remember_import(selected)
         self.load_path(selected)
 
     def load_path(self, selected: str | Path) -> bool:
@@ -805,6 +1507,10 @@ class Infrared3DApp(tk.Tk):
             return False
 
         self.raw_data = loaded.values
+        self.dialog_directories.remember_import(selected)
+        self.custom_crop_bounds = None
+        if self.crop_var.get() == CUSTOM_CROP_LABEL:
+            self.crop_var.set(DEFAULT_CROP_LABEL)
         self.refinement_level = 0
         self.refinement_info_var.set("细化次数：0")
         self.source_name = str(Path(selected))
@@ -813,12 +1519,16 @@ class Infrared3DApp(tk.Tk):
         self.source_var.set(
             f"{Path(selected).name}\n{loaded.values.shape[1]} × {loaded.values.shape[0]} px · {loaded.source_format}"
         )
+        self._refresh_crop_info()
         self.status_var.set("已读取数据")
         self.update_plot(reset_camera=True)
         return True
 
     def load_demo(self) -> None:
         self.raw_data = make_demo_data()
+        self.custom_crop_bounds = None
+        if self.crop_var.get() == CUSTOM_CROP_LABEL:
+            self.crop_var.set(DEFAULT_CROP_LABEL)
         self.refinement_level = 0
         self.refinement_info_var.set("细化次数：0")
         self.source_name = "内置示例"
@@ -827,6 +1537,7 @@ class Infrared3DApp(tk.Tk):
         self.source_var.set(
             f"内置示例\n{self.raw_data.shape[1]} × {self.raw_data.shape[0]} px · 二维温度矩阵"
         )
+        self._refresh_crop_info()
         self.status_var.set("正在生成预览…")
         self.after_idle(lambda: self.update_plot(reset_camera=True))
 
@@ -881,9 +1592,13 @@ class Infrared3DApp(tk.Tk):
         if self.raw_data is None:
             return
 
+        if reset_camera:
+            self._set_view_controls_from_preset(DEFAULT_VIEW_NAME)
+
         try:
             settings = self._read_settings()
-            cropped = crop_temperature(self.raw_data, settings.crop_mode)
+            projection, camera, view_zoom = self._read_numeric_view()
+            cropped = self._crop_current_source(settings.crop_mode)
             factor = 2**self.refinement_level
             projected_rows = (cropped.shape[0] - 1) * factor + 1
             projected_columns = (cropped.shape[1] - 1) * factor + 1
@@ -906,16 +1621,6 @@ class Infrared3DApp(tk.Tk):
             self.status_var.set(str(exc))
             return
 
-        camera = VIEW_PRESETS[DEFAULT_VIEW_NAME]
-        if reset_camera:
-            self.view_preset_var.set(DEFAULT_VIEW_NAME)
-        elif self.ax is not None:
-            camera = (
-                float(getattr(self.ax, "elev", camera[0])),
-                float(getattr(self.ax, "azim", camera[1])),
-                float(getattr(self.ax, "roll", camera[2])),
-            )
-
         display_rows = plot_data.shape[0] if self.refinement_level > 0 else 160
         display_columns = plot_data.shape[1] if self.refinement_level > 0 else 160
         z_small, row_indices, column_indices = downsample_grid(
@@ -930,12 +1635,12 @@ class Infrared3DApp(tk.Tk):
         xx, yy = np.meshgrid(x, y)
 
         self.figure.clear()
-        # Transparent 3-D collections must be composited after the opaque
-        # sample.  Automatic collection-level sorting is unstable for a water
-        # plane intersected by many peaks, so use the explicit material order
-        # defined above.  It remains stable while the user rotates the view.
+        # Keep every face and grid segment in a single collection.  Matplotlib
+        # can then depth-sort the actual geometry instead of painting whole
+        # materials in a fixed order.
         self.ax = self.figure.add_subplot(111, projection="3d", computed_zorder=False)
         self.ax.set_facecolor("#f4f6f8")
+        scene = _SceneMesh()
         sample_base = self._draw_sample(
             xx,
             yy,
@@ -943,6 +1648,7 @@ class Infrared3DApp(tk.Tk):
             raw_small,
             result.waterline_temperature,
             settings,
+            scene,
         )
         water_bottom, water_top = self._draw_glass_water(
             xx,
@@ -952,7 +1658,9 @@ class Infrared3DApp(tk.Tk):
             raw_small,
             sample_base,
             settings,
+            scene,
         )
+        self.ax.add_collection3d(scene.to_collection())
 
         x_span = max(float(np.ptp(x)), refined_pixel_size)
         y_span = max(float(np.ptp(y)), refined_pixel_size)
@@ -965,8 +1673,12 @@ class Infrared3DApp(tk.Tk):
             z_span * settings.vertical_scale,
             max(display_x, display_y) * 0.002,
         )
+        self.ax.set_xlim(float(np.min(x)), float(np.max(x)))
+        self.ax.set_ylim(float(np.min(y)), float(np.max(y)))
         self.ax.set_zlim(z_min, z_max)
-        self.ax.set_box_aspect((display_x, display_y, z_box))
+        self._current_box_aspect = (display_x, display_y, z_box)
+        self.ax.set_box_aspect(self._current_box_aspect, zoom=view_zoom)
+        self.ax.set_proj_type(projection)
         self.ax.set_axis_off()
         self.ax.view_init(elev=camera[0], azim=camera[1], roll=camera[2])
         self.ax.margins(0)
@@ -996,6 +1708,7 @@ class Infrared3DApp(tk.Tk):
         raw: np.ndarray,
         waterline: float,
         settings: RenderSettings,
+        scene: _SceneMesh,
     ) -> float:
         normalized_height = z - float(np.min(z))
         height_span = float(np.ptp(normalized_height))
@@ -1029,32 +1742,25 @@ class Infrared3DApp(tk.Tk):
         alpha = np.where(submerged, settings.below_alpha, settings.above_alpha)
         rgba = np.concatenate([rgb, alpha[..., None]], axis=2)
 
-        self.ax.plot_surface(
-            xx,
-            yy,
-            z,
-            facecolors=rgba,
-            linewidth=0,
-            antialiased=False,
-            shade=False,
-            rstride=1,
-            cstride=1,
-            zorder=SAMPLE_SURFACE_ZORDER,
-        )
+        scene.add_surface(xx, yy, z, rgba)
 
         if settings.show_grid:
             row_stride = max(1, int(np.ceil(z.shape[0] / settings.grid_count)))
             column_stride = max(1, int(np.ceil(z.shape[1] / settings.grid_count)))
-            self.ax.plot_wireframe(
-                xx,
-                yy,
-                z + max(float(np.ptp(z)), 0.01) * 0.001,
-                rstride=row_stride,
-                cstride=column_stride,
-                color=(0.08, 0.10, 0.12, 0.38),
-                linewidth=0.42,
-                zorder=SAMPLE_WALL_ZORDER + 1,
-            )
+            grid_z = z + max(float(np.ptp(z)), 0.01) * 0.001
+            row_positions = list(range(0, z.shape[0], row_stride))
+            column_positions = list(range(0, z.shape[1], column_stride))
+            if row_positions[-1] != z.shape[0] - 1:
+                row_positions.append(z.shape[0] - 1)
+            if column_positions[-1] != z.shape[1] - 1:
+                column_positions.append(z.shape[1] - 1)
+            grid_color = (0.08, 0.10, 0.12, 0.38)
+            for row in row_positions:
+                scene.add_polyline(xx[row], yy[row], grid_z[row], grid_color)
+            for column in column_positions:
+                scene.add_polyline(
+                    xx[:, column], yy[:, column], grid_z[:, column], grid_color
+                )
 
         z_range = max(float(np.ptp(z)), 0.01)
         base_z = float(np.min(z)) - 0.12 * z_range
@@ -1095,27 +1801,21 @@ class Infrared3DApp(tk.Tk):
                 wall_alpha = settings.below_alpha if is_below else settings.above_alpha
                 wall_colors.append((*wall_rgb, wall_alpha))
 
-        wall_collection = Poly3DCollection(
+        scene.add_faces(
             walls,
-            facecolors=wall_colors,
-            edgecolors=(0.15, 0.17, 0.19, 0.12),
-            linewidths=0.15,
-            zorder=SAMPLE_WALL_ZORDER,
+            np.asarray(wall_colors),
+            (0.15, 0.17, 0.19, 0.12),
         )
-        self.ax.add_collection3d(wall_collection)
         bottom_rgb = np.clip(below_base * 0.62, 0.0, 1.0)
-        bottom = Poly3DCollection(
+        scene.add_faces(
             [[
                 (xx[0, 0], yy[0, 0], base_z),
                 (xx[0, -1], yy[0, -1], base_z),
                 (xx[-1, -1], yy[-1, -1], base_z),
                 (xx[-1, 0], yy[-1, 0], base_z),
             ]],
-            facecolors=[(*bottom_rgb, settings.below_alpha)],
-            edgecolors="none",
-            zorder=SAMPLE_WALL_ZORDER,
+            (*bottom_rgb, settings.below_alpha),
         )
-        self.ax.add_collection3d(bottom)
         return base_z
 
     def _draw_glass_water(
@@ -1127,6 +1827,7 @@ class Infrared3DApp(tk.Tk):
         raw_surface: np.ndarray,
         sample_base: float,
         settings: RenderSettings,
+        scene: _SceneMesh,
     ) -> tuple[float, float]:
         # The water footprint is intentionally identical to the solid footprint.
         # It must not extend around or below the sample boundary.
@@ -1159,18 +1860,7 @@ class Infrared3DApp(tk.Tk):
         water_rgba[..., :3] = base_rgb
         water_rgba[..., 3] = settings.water_alpha
         if np.any(np.isfinite(water_z_visible)):
-            self.ax.plot_surface(
-                water_xx,
-                water_yy,
-                water_z_visible,
-                facecolors=water_rgba,
-                linewidth=0,
-                antialiased=True,
-                shade=False,
-                rstride=1,
-                cstride=1,
-                zorder=WATER_TOP_ZORDER,
-            )
+            scene.add_surface(water_xx, water_yy, water_z_visible, water_rgba)
 
         water_bottom = sample_base
         side_faces: list[list[tuple[float, float, float]]] = []
@@ -1192,40 +1882,21 @@ class Infrared3DApp(tk.Tk):
                     ]
                 )
                 side_colors.append((*base_rgb, settings.water_alpha))
-        side_collection = Poly3DCollection(
-            side_faces,
-            facecolors=side_colors,
-            edgecolors="none",
-            linewidths=0,
-            zorder=WATER_SIDE_ZORDER,
-        )
-        self.ax.add_collection3d(side_collection)
+        scene.add_faces(side_faces, np.asarray(side_colors))
 
-        bottom_face = Poly3DCollection(
-            [[
-                (water_x[0], water_y[0], water_bottom),
-                (water_x[-1], water_y[0], water_bottom),
-                (water_x[-1], water_y[-1], water_bottom),
-                (water_x[0], water_y[-1], water_bottom),
-            ]],
-            facecolors=[(*base_rgb, settings.water_alpha)],
-            edgecolors="none",
-            zorder=WATER_BOTTOM_ZORDER,
-        )
-        self.ax.add_collection3d(bottom_face)
+        # Do not add a horizontal face at ``water_bottom``.  That face would be
+        # completely hidden below the sample in a real scene, but it used to be
+        # one footprint-sized translucent quad.  Matplotlib sorts a polygon by
+        # one average depth, so at near-horizontal views half of that enormous
+        # rear quad could be painted over a foreground dry peak.  The water top
+        # and its four perimeter walls already provide the intended glass-like
+        # volume without introducing an invisible layer that can leak through.
 
         if settings.show_water_edges:
             edge_rgb = np.clip(base_rgb * 0.85 + 0.15, 0.0, 1.0)
             edge_color = (*edge_rgb, settings.water_alpha)
             for edge_x, edge_y, edge_z in perimeter:
-                self.ax.plot(
-                    edge_x,
-                    edge_y,
-                    edge_z,
-                    color=edge_color,
-                    linewidth=0.85,
-                    zorder=WATER_EDGE_ZORDER,
-                )
+                scene.add_polyline(edge_x, edge_y, edge_z, edge_color)
             corners = [
                 (water_x[0], water_y[0], water_z[0, 0]),
                 (water_x[-1], water_y[0], water_z[0, -1]),
@@ -1233,13 +1904,11 @@ class Infrared3DApp(tk.Tk):
                 (water_x[0], water_y[-1], water_z[-1, 0]),
             ]
             for corner_x, corner_y, corner_z in corners:
-                self.ax.plot(
+                scene.add_polyline(
                     [corner_x, corner_x],
                     [corner_y, corner_y],
                     [water_bottom, corner_z],
-                    color=edge_color,
-                    linewidth=0.75,
-                    zorder=WATER_EDGE_ZORDER,
+                    edge_color,
                 )
 
         visible_top = (
@@ -1255,16 +1924,116 @@ class Infrared3DApp(tk.Tk):
         self.view_preset_var.set(name)
         self.apply_view_preset()
 
+    def _read_numeric_view(
+        self,
+    ) -> tuple[str, tuple[float, float, float], float]:
+        projection_label = self.projection_var.get()
+        if projection_label not in PROJECTION_MODES:
+            raise ValueError("请选择透视投影或正交投影。")
+        rotation_x = float(self.rotation_x_var.get())
+        rotation_y = float(self.rotation_y_var.get())
+        rotation_z = float(self.rotation_z_var.get())
+        if not all(
+            -180.0 <= angle <= 180.0
+            for angle in (rotation_x, rotation_y, rotation_z)
+        ):
+            raise ValueError("样品 X/Y/Z 旋转角必须在 −180°–180° 之间。")
+        zoom_percent = float(self.view_zoom_var.get())
+        if not 20.0 <= zoom_percent <= 300.0:
+            raise ValueError("视图缩放比例必须在 20%–300% 之间。")
+        return (
+            PROJECTION_MODES[projection_label],
+            sample_rotation_to_camera(rotation_x, rotation_y, rotation_z),
+            zoom_percent / 100.0,
+        )
+
+    def _set_view_controls_from_preset(self, name: str) -> None:
+        preset = VIEW_PRESETS.get(name)
+        if preset is None:
+            return
+        if self._view_update_job is not None:
+            self.after_cancel(self._view_update_job)
+            self._view_update_job = None
+        self._syncing_view_controls = True
+        try:
+            self.view_preset_var.set(name)
+            self.projection_var.set(preset.projection)
+            self.rotation_x_var.set(preset.rotation_x)
+            self.rotation_y_var.set(preset.rotation_y)
+            self.rotation_z_var.set(preset.rotation_z)
+            self.view_zoom_var.set(preset.zoom_percent)
+        finally:
+            self._syncing_view_controls = False
+
     def apply_view_preset(self, _event: object | None = None) -> None:
+        name = self.view_preset_var.get()
+        if name not in VIEW_PRESETS:
+            return
+        self._set_view_controls_from_preset(name)
+        if self.ax is not None:
+            self._apply_numeric_view(update_status=False)
+        self.status_var.set(f"已切换视角：{name}")
+
+    def _run_scheduled_view_update(self) -> None:
+        self._view_update_job = None
+        self._apply_numeric_view()
+
+    def _apply_numeric_view(self, update_status: bool = True) -> None:
         if self.ax is None:
             return
-        name = self.view_preset_var.get()
-        camera = VIEW_PRESETS.get(name)
-        if camera is None:
+        if self._view_update_job is not None:
+            self.after_cancel(self._view_update_job)
+            self._view_update_job = None
+        try:
+            projection, camera, view_zoom = self._read_numeric_view()
+        except (ValueError, tk.TclError) as exc:
+            self.status_var.set(str(exc))
             return
+        self.ax.set_proj_type(projection)
+        if self._current_box_aspect is not None:
+            self.ax.set_box_aspect(self._current_box_aspect, zoom=view_zoom)
         self.ax.view_init(elev=camera[0], azim=camera[1], roll=camera[2])
         self.canvas.draw_idle()
-        self.status_var.set(f"已切换视角：{name}")
+        if update_status:
+            projection_name = self.projection_var.get().replace("投影", "")
+            self.status_var.set(
+                f"定量视角：X {self.rotation_x_var.get():g}° · "
+                f"Y {self.rotation_y_var.get():g}° · Z {self.rotation_z_var.get():g}° · "
+                f"{projection_name} · {self.view_zoom_var.get():g}%"
+            )
+
+    def _on_view_interaction_end(self, event: object) -> None:
+        if self.ax is None or getattr(event, "inaxes", None) is not self.ax:
+            return
+        button = getattr(event, "button", None)
+        if getattr(button, "value", button) != 1:
+            return
+        rotation = camera_to_sample_rotation(
+            float(self.ax.elev), float(self.ax.azim), float(self.ax.roll)
+        )
+        self._syncing_view_controls = True
+        try:
+            self.view_preset_var.set(CUSTOM_VIEW_NAME)
+            self.rotation_x_var.set(round(rotation[0], 2))
+            self.rotation_y_var.set(round(rotation[1], 2))
+            self.rotation_z_var.set(round(rotation[2], 2))
+        finally:
+            self._syncing_view_controls = False
+        self.status_var.set("已同步拖动后的样品旋转角度")
+
+    def _on_scroll_zoom(self, event: object) -> None:
+        if self.ax is None or getattr(event, "inaxes", None) is not self.ax:
+            return
+        direction = getattr(event, "button", None)
+        step = float(getattr(event, "step", 0.0) or 0.0)
+        factor = 1.1 if direction == "up" or step > 0 else 1.0 / 1.1
+        try:
+            current = float(self.view_zoom_var.get())
+        except (ValueError, tk.TclError):
+            current = 100.0
+        new_zoom = min(300.0, max(20.0, current * factor))
+        self.view_zoom_var.set(round(new_zoom, 1))
+        self._apply_numeric_view()
 
     def reset_view(self) -> None:
         self.set_view_preset(DEFAULT_VIEW_NAME)
@@ -1278,6 +2047,7 @@ class Infrared3DApp(tk.Tk):
             title="导出当前 3D 视角",
             defaultextension=".png",
             initialfile="infrared_3d_illustration.png",
+            initialdir=str(self.dialog_directories.export_directory),
             filetypes=[
                 ("PNG 图像", "*.png"),
                 ("TIFF 图像", "*.tif *.tiff"),
@@ -1285,25 +2055,56 @@ class Infrared3DApp(tk.Tk):
         )
         if not selected:
             return
+        self.dialog_directories.remember_export(selected)
 
         try:
-            dpi = int(self.dpi_var.get())
-            if not 72 <= dpi <= 1200:
-                raise ValueError("导出分辨率必须在 72–1200 DPI 之间。")
+            dpi, size_inches = self._read_export_settings()
             output = save_figure_image(
                 self.figure,
                 selected,
                 dpi,
                 transparent_background=bool(self.export_transparent_var.get()),
+                size_inches=size_inches,
             )
         except Exception as exc:
             messagebox.showerror("导出失败", str(exc), parent=self)
             self.status_var.set("导出失败")
             return
 
+        source_copy: Path | None = None
+        source_copy_error: Exception | None = None
+        if self.export_cropped_source_var.get():
+            try:
+                cropped_source = self._crop_current_source()
+                source_copy = save_cropped_source_copy(
+                    cropped_source,
+                    self.source_name,
+                    output,
+                )
+            except Exception as exc:
+                source_copy_error = exc
+
         background_note = "透明背景" if self.export_transparent_var.get() else "预览背景"
-        self.status_var.set(f"已导出：{output.name}（{background_note}）")
-        messagebox.showinfo("导出完成", f"图像已保存到：\n{output}", parent=self)
+        if source_copy_error is not None:
+            self.status_var.set(f"已导出图像，但源数据副本失败：{output.name}")
+            messagebox.showwarning(
+                "图像已导出",
+                f"图像已保存到：\n{output}\n\n"
+                f"裁剪源数据副本保存失败：\n{source_copy_error}",
+                parent=self,
+            )
+            return
+
+        copy_note = f"\n\n裁剪源数据副本：\n{source_copy}" if source_copy else ""
+        self.status_var.set(
+            f"已导出：{output.name}（{background_note}）"
+            + (f"；数据：{source_copy.name}" if source_copy else "")
+        )
+        messagebox.showinfo(
+            "导出完成",
+            f"图像已保存到：\n{output}{copy_note}",
+            parent=self,
+        )
 
 
 def _enable_high_dpi() -> None:

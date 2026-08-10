@@ -29,6 +29,20 @@ class CoreTests(unittest.TestCase):
         cropped = crop_temperature(source, "xy")
         np.testing.assert_array_equal(cropped, source[3:6, 4:8])
 
+    def test_custom_crop_uses_exact_pixel_bounds(self) -> None:
+        source = np.arange(8 * 10, dtype=float).reshape(8, 10)
+        cropped = crop_temperature(source, "custom", (1, 6, 3, 9))
+
+        np.testing.assert_array_equal(cropped, source[1:6, 3:9])
+
+    def test_custom_crop_rejects_too_small_or_out_of_range_bounds(self) -> None:
+        source = np.arange(8 * 10, dtype=float).reshape(8, 10)
+
+        with self.assertRaises(ValueError):
+            crop_temperature(source, "custom", (1, 2, 3, 9))
+        with self.assertRaises(ValueError):
+            crop_temperature(source, "custom", (1, 6, 3, 11))
+
     def test_absorption_matches_requested_example(self) -> None:
         source = np.array([[24.0, 25.8, 26.0]])
         result = apply_immersion_absorption(source, 0.9, 0.8)

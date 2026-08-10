@@ -13,25 +13,27 @@ if str(PROJECT) not in sys.path:
     sys.path.insert(0, str(PROJECT))
 
 from app import (  # noqa: E402
+    CUSTOM_VIEW_NAME,
     DEFAULT_VIEW_NAME,
     Infrared3DApp,
+    ORTHOGRAPHIC_LABEL,
+    PERSPECTIVE_LABEL,
     RenderSettings,
-    SAMPLE_SURFACE_ZORDER,
+    SCENE_SURFACE_ZORDER,
     VIEW_PRESETS,
-    WATER_BOTTOM_ZORDER,
-    WATER_SIDE_ZORDER,
-    WATER_TOP_ZORDER,
+    _SceneMesh,
+    sample_rotation_to_camera,
 )
 
 
 class _VariableStub:
-    def __init__(self, value: str = "") -> None:
+    def __init__(self, value: object = "") -> None:
         self.value = value
 
-    def get(self) -> str:
+    def get(self) -> object:
         return self.value
 
-    def set(self, value: str) -> None:
+    def set(self, value: object) -> None:
         self.value = value
 
 
@@ -44,15 +46,16 @@ class _CanvasStub:
 
 
 class WaterRenderingTests(unittest.TestCase):
-    def test_water_faces_share_material_and_render_after_sample(self) -> None:
+    def test_scene_faces_share_one_depth_sorted_collection(self) -> None:
         renderer = object.__new__(Infrared3DApp)
         figure = Figure(figsize=(4, 3))
         renderer.ax = figure.add_subplot(111, projection="3d", computed_zorder=False)
 
-        coordinates = np.linspace(-1.0, 1.0, 3)
+        coordinates = np.linspace(-1.0, 1.0, 4)
         xx, yy = np.meshgrid(coordinates, coordinates)
-        raw = np.full((3, 3), 24.0)
-        display = np.full((3, 3), 24.6)
+        raw = np.full((4, 4), 24.0)
+        raw[1:3, 1:3] = 26.0
+        display = raw.copy()
         waterline = 25.0
         settings = RenderSettings(
             crop_mode="none",
@@ -67,21 +70,22 @@ class WaterRenderingTests(unittest.TestCase):
             above_alpha=1.0,
             below_color=(0.4, 0.4, 0.4),
             below_brightness=1.0,
-            below_alpha=1.0,
+            below_alpha=0.62,
             water_color=(1.0, 0.0, 0.0),
             water_brightness=1.0,
             water_alpha=0.37,
             gradient_enabled=False,
             gradient_strength=0.0,
             gradient_gamma=1.0,
-            show_grid=False,
+            show_grid=True,
             grid_count=10,
             show_solid_walls=False,
             show_water_edges=False,
         )
 
+        scene = _SceneMesh()
         sample_base = renderer._draw_sample(
-            xx, yy, display, raw, waterline, settings
+            xx, yy, display, raw, waterline, settings, scene
         )
         renderer._draw_glass_water(
             xx,
@@ -91,47 +95,114 @@ class WaterRenderingTests(unittest.TestCase):
             raw,
             sample_base,
             settings,
+            scene,
         )
+        renderer.ax.add_collection3d(scene.to_collection())
 
-        collections_by_zorder = {
-            collection.get_zorder(): collection for collection in renderer.ax.collections
-        }
-        self.assertIn(SAMPLE_SURFACE_ZORDER, collections_by_zorder)
-        self.assertIn(WATER_BOTTOM_ZORDER, collections_by_zorder)
-        self.assertIn(WATER_SIDE_ZORDER, collections_by_zorder)
-        self.assertIn(WATER_TOP_ZORDER, collections_by_zorder)
-        self.assertLess(SAMPLE_SURFACE_ZORDER, WATER_BOTTOM_ZORDER)
-        self.assertLess(WATER_BOTTOM_ZORDER, WATER_SIDE_ZORDER)
-        self.assertLess(WATER_SIDE_ZORDER, WATER_TOP_ZORDER)
+        # The opaque sample, translucent water and grid must not be separate
+        # collections: collection-level painter ordering is what allowed rear
+        # water/grid geometry to show through a 100%-opaque front peak.
+        self.assertEqual(len(renderer.ax.collections), 1)
+        collection = renderer.ax.collections[0]
+        self.assertEqual(collection.get_zorder(), SCENE_SURFACE_ZORDER)
 
         expected_rgb = np.array([1.0, 0.0, 0.0])
-        for zorder in (WATER_BOTTOM_ZORDER, WATER_SIDE_ZORDER, WATER_TOP_ZORDER):
-            colors = collections_by_zorder[zorder].get_facecolors()
-            expected_colors = np.repeat(expected_rgb[None, :], len(colors), axis=0)
-            np.testing.assert_allclose(colors[:, :3], expected_colors, atol=1e-12)
-            np.testing.assert_allclose(colors[:, 3], 0.37, atol=1e-12)
+        colors = collection.get_facecolors()
+        water_colors = colors[np.isclose(colors[:, 3], 0.37)]
+        self.assertGreater(len(water_colors), 0)
+        np.testing.assert_allclose(
+            water_colors[:, :3],
+            np.repeat(expected_rgb[None, :], len(water_colors), axis=0),
+            atol=1e-12,
+        )
+        self.assertTrue(np.any(np.isclose(colors[:, 3], 1.0)))
+        self.assertTrue(np.any(np.isclose(collection.get_edgecolors()[:, 3], 0.38)))
 
-    def test_view_presets_apply_angles_without_rebuilding_plot(self) -> None:
+        faces = np.concatenate(scene._faces, axis=0)
+        facecolors = np.concatenate(scene._facecolors, axis=0)
+        is_water = np.isclose(facecolors[:, 3], settings.water_alpha) & np.all(
+            np.isclose(facecolors[:, :3], settings.water_color), axis=1
+        )
+        water_faces = faces[is_water]
+        hidden_bottom = np.all(
+            np.isclose(water_faces[:, :, 2], sample_base), axis=1
+        )
+        self.assertFalse(
+            np.any(hidden_bottom),
+            "A footprint-sized water-bottom face can sort over dry sample peaks.",
+        )
+
+    @staticmethod
+    def _make_view_renderer(preset_name: str) -> Infrared3DApp:
         renderer = object.__new__(Infrared3DApp)
         figure = Figure(figsize=(4, 3))
         renderer.ax = figure.add_subplot(111, projection="3d")
         renderer.canvas = _CanvasStub()
         renderer.status_var = _VariableStub()
-        renderer.view_preset_var = _VariableStub("立方体 · 角（等轴测）")
+        renderer.view_preset_var = _VariableStub(preset_name)
+        renderer.projection_var = _VariableStub(PERSPECTIVE_LABEL)
+        renderer.rotation_x_var = _VariableStub(0.0)
+        renderer.rotation_y_var = _VariableStub(0.0)
+        renderer.rotation_z_var = _VariableStub(0.0)
+        renderer.view_zoom_var = _VariableStub(100.0)
+        renderer._view_update_job = None
+        renderer._syncing_view_controls = False
+        renderer._current_box_aspect = (1.0, 1.0, 0.5)
+        return renderer
+
+    def test_orthographic_preset_applies_projection_and_numeric_angles(self) -> None:
+        renderer = self._make_view_renderer("正交 · 等轴测")
 
         renderer.apply_view_preset()
 
         self.assertAlmostEqual(renderer.ax.elev, 35.264)
         self.assertAlmostEqual(renderer.ax.azim, -45.0)
+        self.assertTrue(np.isinf(renderer.ax._focal_length))
+        self.assertEqual(renderer.projection_var.get(), ORTHOGRAPHIC_LABEL)
+        self.assertAlmostEqual(renderer.rotation_x_var.get(), 35.264)
+        self.assertAlmostEqual(renderer.rotation_y_var.get(), 45.0)
         self.assertEqual(renderer.canvas.draw_count, 1)
         self.assertIn("等轴测", renderer.status_var.get())
 
         renderer.reset_view()
         self.assertEqual(renderer.view_preset_var.get(), DEFAULT_VIEW_NAME)
+        default = VIEW_PRESETS[DEFAULT_VIEW_NAME]
         self.assertEqual(
             (renderer.ax.elev, renderer.ax.azim, renderer.ax.roll),
-            VIEW_PRESETS[DEFAULT_VIEW_NAME],
+            sample_rotation_to_camera(
+                default.rotation_x, default.rotation_y, default.rotation_z
+            ),
         )
+        self.assertEqual(renderer.projection_var.get(), PERSPECTIVE_LABEL)
+        self.assertFalse(np.isinf(renderer.ax._focal_length))
+
+    def test_numeric_view_applies_rotation_zoom_and_syncs_manual_drag(self) -> None:
+        renderer = self._make_view_renderer(CUSTOM_VIEW_NAME)
+        renderer.projection_var.set(ORTHOGRAPHIC_LABEL)
+        renderer.rotation_x_var.set(12.0)
+        renderer.rotation_y_var.set(34.0)
+        renderer.rotation_z_var.set(-7.0)
+        renderer.view_zoom_var.set(135.0)
+
+        renderer._apply_numeric_view()
+
+        self.assertEqual(
+            (renderer.ax.elev, renderer.ax.azim, renderer.ax.roll),
+            sample_rotation_to_camera(12.0, 34.0, -7.0),
+        )
+        zoomed_norm = float(np.linalg.norm(renderer.ax._box_aspect))
+        renderer.view_zoom_var.set(100.0)
+        renderer._apply_numeric_view()
+        normal_norm = float(np.linalg.norm(renderer.ax._box_aspect))
+        self.assertAlmostEqual(zoomed_norm / normal_norm, 1.35)
+
+        renderer.ax.view_init(elev=22.0, azim=-15.0, roll=8.0)
+        event = type("Event", (), {"inaxes": renderer.ax, "button": 1})()
+        renderer._on_view_interaction_end(event)
+        self.assertEqual(renderer.view_preset_var.get(), CUSTOM_VIEW_NAME)
+        self.assertEqual(renderer.rotation_x_var.get(), 22.0)
+        self.assertEqual(renderer.rotation_y_var.get(), 75.0)
+        self.assertEqual(renderer.rotation_z_var.get(), 8.0)
 
 
 if __name__ == "__main__":

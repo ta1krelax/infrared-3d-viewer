@@ -203,28 +203,112 @@ def load_temperature_file(path: str | Path) -> TemperatureData:
     return load_temperature_txt(path)
 
 
-def crop_temperature(values: np.ndarray, mode: str = "xy") -> np.ndarray:
-    """Crop the center third along both, one, or neither spatial dimension."""
+def crop_bounds_for_mode(
+    shape: tuple[int, int], mode: str = "xy"
+) -> tuple[int, int, int, int]:
+    """Return row-start/stop and column-start/stop bounds for a crop preset."""
+
+    rows, columns = shape
+    if rows < 2 or columns < 2:
+        raise ValueError("温度数据至少需要 2×2 个像素。")
+    if mode not in {"xy", "x", "y", "none"}:
+        raise ValueError(f"未知截取方式：{mode}")
+
+    def middle_third(length: int) -> tuple[int, int]:
+        if length < 3:
+            return 0, length
+        start = length // 3
+        return start, length - start
+
+    row_start, row_stop = middle_third(rows) if mode in {"xy", "y"} else (0, rows)
+    column_start, column_stop = (
+        middle_third(columns) if mode in {"xy", "x"} else (0, columns)
+    )
+    return row_start, row_stop, column_start, column_stop
+
+
+def validate_crop_bounds(
+    bounds: tuple[int, int, int, int], shape: tuple[int, int]
+) -> tuple[int, int, int, int]:
+    """Validate custom row/column bounds and require a drawable 2×2 region."""
+
+    if len(bounds) != 4:
+        raise ValueError("自定义裁剪区域必须包含四个边界值。")
+    rows, columns = shape
+    row_start, row_stop, column_start, column_stop = (int(value) for value in bounds)
+    if not (0 <= row_start < row_stop <= rows):
+        raise ValueError("自定义裁剪区域的 Y 边界超出原图。")
+    if not (0 <= column_start < column_stop <= columns):
+        raise ValueError("自定义裁剪区域的 X 边界超出原图。")
+    if row_stop - row_start < 2 or column_stop - column_start < 2:
+        raise ValueError("自定义裁剪区域至少需要 2×2 个像素。")
+    return row_start, row_stop, column_start, column_stop
+
+
+def crop_temperature(
+    values: np.ndarray,
+    mode: str = "xy",
+    custom_bounds: tuple[int, int, int, int] | None = None,
+) -> np.ndarray:
+    """Crop using a center preset, the full image, or explicit pixel bounds."""
 
     array = np.asarray(values, dtype=float)
     if array.ndim != 2:
         raise ValueError("温度数据必须是二维矩阵。")
-    if mode not in {"xy", "x", "y", "none"}:
-        raise ValueError(f"未知截取方式：{mode}")
-
-    def middle_third(length: int) -> slice:
-        if length < 3:
-            return slice(0, length)
-        start = length // 3
-        stop = length - start
-        return slice(start, stop)
-
-    row_slice = middle_third(array.shape[0]) if mode in {"xy", "y"} else slice(None)
-    column_slice = middle_third(array.shape[1]) if mode in {"xy", "x"} else slice(None)
-    result = array[row_slice, column_slice]
+    if mode == "custom":
+        if custom_bounds is None:
+            raise ValueError("请先在裁剪选择窗口中确定自定义区域。")
+        row_start, row_stop, column_start, column_stop = validate_crop_bounds(
+            custom_bounds, array.shape
+        )
+    else:
+        row_start, row_stop, column_start, column_stop = crop_bounds_for_mode(
+            array.shape, mode
+        )
+    result = array[row_start:row_stop, column_start:column_stop]
     if min(result.shape) < 2:
         raise ValueError("截取后数据太小，无法绘制 3D 表面。")
     return result
+
+
+def save_cropped_source_copy(
+    values: np.ndarray,
+    source_name: str | Path,
+    image_output: str | Path,
+) -> Path:
+    """Save cropped source values beside an exported image without overwriting."""
+
+    array = np.asarray(values, dtype=float)
+    if array.ndim != 2 or array.size == 0 or not np.all(np.isfinite(array)):
+        raise ValueError("导出的裁剪源数据必须是非空、有限的二维矩阵。")
+
+    source_suffix = Path(source_name).suffix.lower()
+    if source_suffix not in {".txt", ".csv", ".dat", ".tif", ".tiff"}:
+        source_suffix = ".txt"
+
+    image_path = Path(image_output)
+    base = image_path.with_name(f"{image_path.stem}_cropped_source{source_suffix}")
+    output = base
+    copy_number = 2
+    while output.exists():
+        output = base.with_name(f"{base.stem}_{copy_number}{base.suffix}")
+        copy_number += 1
+
+    if source_suffix in {".tif", ".tiff"}:
+        try:
+            import tifffile
+        except ImportError as exc:
+            raise ValueError("导出 TIFF 数据副本需要 tifffile 组件。") from exc
+        tifffile.imwrite(
+            output,
+            array.astype(np.float32),
+            compression="lzw",
+            metadata=None,
+        )
+    else:
+        delimiter = "," if source_suffix == ".csv" else "\t"
+        np.savetxt(output, array, fmt="%.12g", delimiter=delimiter)
+    return output
 
 
 def apply_immersion_absorption(
